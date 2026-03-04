@@ -1,0 +1,16 @@
+# 生产环境依赖文件
+# 包含所有运行时依赖和生产环境特定的包
+
+# 基础依赖（来自 requirements.txt）
+paddlepaddle==2.6.2
+paddleocr==2.8.1
+PyMuPDF==1.23.8
+opencv-python-headless==4.8.1.78
+numpy==1.24.3
+Pillow==10.1.0
+flask>=2.0.0
+
+# 生产环境额外依赖
+gunicorn>=20.1.0          # WSGI HTTP 服务器
+gevent>=22.10.0           # 异步 worker（可选）
+python-dotenv>=0.19.0     # 环境变量管理
