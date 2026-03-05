@@ -8,3 +8,15 @@
 [Wed Mar  4 13:02:29 2026] Verifying: ['GB 23200.113- 2018', 'GB 23200.121- 2021']
 [Wed Mar  4 13:02:38 2026] Finished GB 23200.121- 2021: error
 [Wed Mar  4 13:03:16 2026] Finished GB 23200.113- 2018: error
+[Thu Mar  5 19:22:17 2026] Verifying: ['GB 2763-2021']
+[Thu Mar  5 19:24:07 2026] Finished GB 2763-2021: obsolete
+[Thu Mar  5 19:24:07 2026] Verifying: ['GB 23200.121- 2021', 'GB 23200.113- 2018']
+[Thu Mar  5 19:25:12 2026] Finished GB 23200.121- 2021: obsolete
+[Thu Mar  5 19:25:18 2026] Finished GB 23200.113- 2018: invalid
+[Thu Mar  5 21:08:31 2026] Verifying: ['GB 2763-2021']
+[Thu Mar  5 21:09:27 2026] Finished GB 2763-2021: obsolete
+[Thu Mar  5 21:09:27 2026] Verifying: ['GB 23200.121- 2021', 'GB 23200.113- 2018']
+[Thu Mar  5 21:10:22 2026] Finished GB 23200.113- 2018: obsolete
+[Thu Mar  5 21:10:24 2026] Finished GB 23200.121- 2021: obsolete
+[Thu Mar  5 21:24:13 2026] Verifying: ['GB 23200.113-2018']
+[Thu Mar  5 21:27:16 2026] Finished GB 23200.113-2018: obsolete

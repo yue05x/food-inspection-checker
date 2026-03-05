@@ -44,7 +44,16 @@ def fetch_detail_page_content(url: str, timeout: int = 30) -> str:
             })
             
             # 访问页面
-            page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
+            try:
+                page.goto(url, timeout=timeout * 1000, wait_until="commit")
+                # 等待一会儿让正文加载
+                page.wait_for_timeout(2000) 
+            except Exception as e:
+                if "Timeout" in str(e):
+                    print(f"Playwright navigation timeout for {url}, trying to extract available content anyway...")
+                else:
+                    raise
+            
             content = page.content()
             browser.close()
             return content

@@ -13,9 +13,8 @@ function statusClass(s) {
     return 'unknown'
 }
 
-/* ───────── 综合核对结果 Tab ───────── */
-function SummaryTab({ result, onSwitchTab }) {
-    const s = result.summary || {}
+function calculateModulesStatus(s) {
+    if (!s) s = {}
 
     // ─── 标准指标合理性：从实际证据推算状态 ───
     const rag = s.ragflow_verification || {}
@@ -58,22 +57,44 @@ function SummaryTab({ result, onSwitchTab }) {
         { id: 'package', title: '标签信息', status: labelStatus, desc: '产品标签信息是否完整' },
     ]
 
-    const overallPassed = !result.issues || result.issues.length === 0
+    let failedCount = 0
+    let unknownCount = 0
+    let passedCount = 0
+    modules.forEach(m => {
+        const sc = statusClass(m.status)
+        if (sc === 'failed') failedCount++
+        else if (sc === 'passed') passedCount++
+        else unknownCount++
+    })
+
+    return { modules, failedCount, unknownCount, passedCount }
+}
+
+/* ───────── 综合核对结果 Tab ───────── */
+function SummaryTab({ result, onSwitchTab }) {
+    const s = result.summary || {}
+    const { modules, failedCount, unknownCount } = calculateModulesStatus(s)
+
+    const overallPassed = failedCount === 0 && unknownCount === 0
 
     return (
         <div>
             {/* 总体状态 */}
-            <div className={`overall-status ${overallPassed ? 'passed' : 'failed'}`}>
+            <div className={`overall-status ${failedCount > 0 ? 'failed' : overallPassed ? 'passed' : 'unknown'}`}>
                 <div className="status-icon">
-                    {overallPassed
-                        ? <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
-                        : <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" /></svg>
+                    {failedCount > 0
+                        ? <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" /></svg>
+                        : overallPassed
+                            ? <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
+                            : <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
                     }
                 </div>
                 <div className="status-content">
-                    <h2 className="status-title">{overallPassed ? '验证通过' : '验证未通过'}</h2>
+                    <h2 className="status-title">{failedCount > 0 ? '验证未通过' : overallPassed ? '验证通过' : '待补充信息'}</h2>
                     <p className="status-description">
-                        {overallPassed ? '所有验证项目均符合要求' : `检测到 ${result.issues.length} 个问题需要处理`}
+                        {failedCount > 0 || unknownCount > 0
+                            ? `检测到 ${failedCount} 个模块未通过，${unknownCount} 个模块待验证`
+                            : '所有验证项目均符合要求'}
                     </p>
                 </div>
             </div>
@@ -431,7 +452,18 @@ function MethodComplianceTab({ result, onJumpToPdf }) {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 {matched.map((item, i) => {
                     const hasIssue = issueNames.has(item.name)
-                    const methods = (item.required_method || '').trim().split(/\s+/).filter(Boolean)
+                    const rawMethods = (item.required_method || '').trim().split(/\s+/).filter(Boolean)
+                    const methods = []
+                    for (let k = 0; k < rawMethods.length; k++) {
+                        const token = rawMethods[k]
+                        // 如果 token 是常见的标准前缀（纯字母或带斜杠字母，如 GB, GB/T, NY/T 等），且后面还有内容，则合并为一个完整的标准号
+                        if (/^[A-Za-z]+(?:\/[A-Za-z]+)?$/.test(token) && k + 1 < rawMethods.length) {
+                            methods.push(token + ' ' + rawMethods[k + 1])
+                            k++ // 跳过下一个 token
+                        } else {
+                            methods.push(token)
+                        }
+                    }
                     return (
                         <div key={i} style={{
                             borderRadius: 8,
@@ -770,6 +802,52 @@ export default function ResultPage() {
     const hiddenFileInputRef = useRef(null)
     const [uploadType, setUploadType] = useState(null)
     const [dropdownIdx, setDropdownIdx] = useState(null)  // 当前展开下拉的文件索引
+    const [previewWidth, setPreviewWidth] = useState(42) // 默认 42vw 宽度
+    const [sidebarWidth, setSidebarWidth] = useState(260) // 默认 260px 宽度
+
+    /* 拖拽调整侧边栏宽度 */
+    const handleSidebarDragStart = (e) => {
+        e.preventDefault()
+        const startX = e.clientX
+        const initialWidth = sidebarWidth
+
+        const onMouseMove = (moveEvent) => {
+            const deltaX = moveEvent.clientX - startX
+            const newWidth = initialWidth + deltaX
+            if (newWidth >= 200 && newWidth <= 500) setSidebarWidth(newWidth)
+        }
+
+        const onMouseUp = () => {
+            document.removeEventListener('mousemove', onMouseMove)
+            document.removeEventListener('mouseup', onMouseUp)
+        }
+
+        document.addEventListener('mousemove', onMouseMove)
+        document.addEventListener('mouseup', onMouseUp)
+    }
+
+    /* 拖拽调整预览区宽度 */
+    const handleDragStart = (e) => {
+        e.preventDefault()
+        const startX = e.clientX
+        const initialWidth = previewWidth
+
+        const onMouseMove = (moveEvent) => {
+            const deltaX = moveEvent.clientX - startX
+            const vw = document.documentElement.clientWidth
+            // 向左拖动 deltaX 为负，宽度变大
+            const newWidth = initialWidth - (deltaX / vw) * 100
+            if (newWidth >= 20 && newWidth <= 75) setPreviewWidth(newWidth)
+        }
+
+        const onMouseUp = () => {
+            document.removeEventListener('mousemove', onMouseMove)
+            document.removeEventListener('mouseup', onMouseUp)
+        }
+
+        document.addEventListener('mousemove', onMouseMove)
+        document.addEventListener('mouseup', onMouseUp)
+    }
 
     /* 跳转 PDF 页码 */
     const jumpToPdf = (view, page) => {
@@ -858,7 +936,7 @@ export default function ResultPage() {
                             <polyline points="14 2 14 8 20 8" />
                             <path d="M12 18v-6" /><path d="M8 15h8" />
                         </svg>
-                        <span className="brand-text">InspeX</span>
+                        <span className="brand-text">SafeFood AI Auditor</span>
                     </a>
                     <div className="divider" />
                     <span className="page-title">核查结果</span>
@@ -869,7 +947,7 @@ export default function ResultPage() {
             <main className="app-workspace" style={{ flex: 1, display: 'flex', overflow: 'hidden' }}>
 
                 {/* 左侧：文件列表 */}
-                <aside className="sidebar-files">
+                <aside className="sidebar-files" style={{ width: sidebarWidth, flexShrink: 0 }}>
                     <div className="sidebar-header"><h3>文件列表</h3></div>
                     <div className="sidebar-content">
                         <ul className="file-list-nav">
@@ -886,7 +964,11 @@ export default function ResultPage() {
                                         </div>
                                         <div className="file-meta">
                                             <span className="file-name" title={r.filename}>{r.filename}</span>
-                                            <span className="file-desc">{r.status === 'success' ? '无异常' : `${r.issue_count} 个风险项`}</span>
+                                            {(() => {
+                                                const { failedCount, unknownCount } = calculateModulesStatus(r.summary)
+                                                const risks = failedCount + unknownCount
+                                                return <span className="file-desc">{risks === 0 ? '无异常' : `${risks} 个风险项`}</span>
+                                            })()}
                                         </div>
                                     </div>
                                     <div style={{ position: 'relative' }}>
@@ -946,6 +1028,11 @@ export default function ResultPage() {
                     </div>
                 </aside>
 
+                {/* 侧边栏拖拽控制柄 */}
+                <div className="resizer-handle" onMouseDown={handleSidebarDragStart}>
+                    <div className="resizer-line" />
+                </div>
+
                 {/* 中间：Tab 内容 */}
                 <section className="content-detail">
                     <div className="detail-header">
@@ -975,8 +1062,13 @@ export default function ResultPage() {
                     </div>
                 </section>
 
+                {/* 拖拽控制柄 */}
+                <div className="resizer-handle" onMouseDown={handleDragStart}>
+                    <div className="resizer-line" />
+                </div>
+
                 {/* 右侧：PDF 预览 */}
-                <section className="content-preview">
+                <section className="content-preview" style={{ width: `${previewWidth}vw` }}>
                     <div className="preview-header">
                         <h3>原始报告预览</h3>
                         <div className="preview-controls">
