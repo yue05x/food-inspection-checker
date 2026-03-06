@@ -18,9 +18,13 @@ CONCLUSION_REGEX = re.compile(
 )
 
 GB_REGEX = re.compile(
-    # 匹配 GB 或 GB/T 开头的国家标准号，例如：GB 2763-2021、GB/T 5009.12-2017 等
-    r"GB(?:/T)?\s*\d+(?:\.\d+)?\s*[—\-‑–－]\s*\d{4}"
+    # 匹配 GB / GB/T / GB/Z 开头的国家标准号，年份后缀可选
+    # 例如：GB 2763-2021、GB/T 5009.12-2017、GB/Z 26578、GB 29921（无年份）
+    r"GB(?:/[TZ])?\s*\d{2,}(?:\.\d+)?(?:\s*[—\-‑–－]\s*\d{2,4})?"
 )
+
+# OCR 扫描件中，结论关键字与国标号可能跨行，向后扫描的行数上限
+CONCLUSION_WINDOW = 5
 
 
 def _iter_text_lines(report: Dict[str, Any]) -> Iterable[str]:
@@ -154,6 +158,7 @@ def extract_gb_standards(report: Dict[str, Any]) -> List[str]:
     """Extract GB standard codes such as "GB 2763-2021" from text and tables.
 
     返回去重后的 GB 标准号列表，按在文档中出现的顺序排列。
+    支持扫描件 OCR 结论与国标号跨行的情形（滑动窗口扫描）。
     """
 
     standards: List[str] = []
@@ -168,21 +173,26 @@ def extract_gb_standards(report: Dict[str, Any]) -> List[str]:
                 seen.add(value)
                 standards.append(value)
 
-    # 先遍历所有文本行，只关注和检验结论相关的句子
-    for line in _iter_text_lines(report):
-        if "GB" in line and (
-            any(kw in line for kw in CONCLUSION_KEYWORDS) or "经抽样检验" in line
-        ):
-            _add_from_text(line)
+    # 按页处理：OCR 扫描件中结论关键字与国标号常常出现在相邻行，
+    # 使用滑动窗口将关键字所在行及其后 CONCLUSION_WINDOW 行一并扫描。
+    for page in report.get("pages", []):
+        lines = [ln.strip() for ln in (page.get("text_lines", []) or []) if ln.strip()]
+        for i, line in enumerate(lines):
+            if any(kw in line for kw in CONCLUSION_KEYWORDS) or "经抽样检验" in line:
+                # 当前行 + 后续若干行都纳入扫描（覆盖 OCR 断行情况）
+                for wline in lines[i: i + CONCLUSION_WINDOW + 1]:
+                    if "GB" in wline:
+                        _add_from_text(wline)
 
-    # 再遍历所有表格行，只在包含结论关键字的行中查找 GB
-    for table in _iter_tables(report):
-        for row in table:
-            row_text = " ".join(str(cell) for cell in row)
-            if "GB" in row_text and (
-                any(kw in row_text for kw in CONCLUSION_KEYWORDS) or "经抽样检验" in row_text
-            ):
-                _add_from_text(row_text)
+        # 表格：逐行检查含结论关键字的单元格
+        for table in (page.get("tables", []) or []):
+            for row in table:
+                row_text = " ".join(str(cell) for cell in row)
+                if "GB" in row_text and (
+                    any(kw in row_text for kw in CONCLUSION_KEYWORDS)
+                    or "经抽样检验" in row_text
+                ):
+                    _add_from_text(row_text)
 
     return standards
 
@@ -218,7 +228,7 @@ def extract_gb_standards_with_title(report: Dict[str, Any]) -> List[Dict[str, st
                 raw_title = normalized[start:end]
 
             title = raw_title.strip().strip(" ，,《》[]（）()")
-            # 去掉结尾的“要求/的要求”等修饰词
+            # 去掉结尾的"要求/的要求"等修饰词
             title = re.sub(r"[的]*要求$", "", title).strip()
             key = (code, title)
             if code and key not in seen:
@@ -233,21 +243,25 @@ def extract_gb_standards_with_title(report: Dict[str, Any]) -> List[Dict[str, st
                     results.append({"code": code})
             pos = m.end()
 
-    # 与 extract_gb_standards 保持一致：只在“检验结论/经抽样检验”等语境中查 GB，
-    # 避免第二个表格“检验依据”之类的 GB 号被误收集。
-    for line in _iter_text_lines(report):
-        if "GB" in line and (
-            any(kw in line for kw in CONCLUSION_KEYWORDS) or "经抽样检验" in line
-        ):
-            _add_from_text(line)
+    # 与 extract_gb_standards 保持一致：按页滑动窗口扫描，
+    # 避免 OCR 断行导致结论关键字与国标号不在同一行时漏提取。
+    for page in report.get("pages", []):
+        lines = [ln.strip() for ln in (page.get("text_lines", []) or []) if ln.strip()]
+        for i, line in enumerate(lines):
+            if any(kw in line for kw in CONCLUSION_KEYWORDS) or "经抽样检验" in line:
+                # 合并窗口内各行再提取，确保跨行的 GB号+书名号标题能被完整捕获
+                window_text = " ".join(lines[i: i + CONCLUSION_WINDOW + 1])
+                if "GB" in window_text:
+                    _add_from_text(window_text)
 
-    for table in _iter_tables(report):
-        for row in table:
-            row_text = " ".join(str(cell) for cell in row)
-            if "GB" in row_text and (
-                any(kw in row_text for kw in CONCLUSION_KEYWORDS) or "经抽样检验" in row_text
-            ):
-                _add_from_text(row_text)
+        for table in (page.get("tables", []) or []):
+            for row in table:
+                row_text = " ".join(str(cell) for cell in row)
+                if "GB" in row_text and (
+                    any(kw in row_text for kw in CONCLUSION_KEYWORDS)
+                    or "经抽样检验" in row_text
+                ):
+                    _add_from_text(row_text)
 
     return results
 
