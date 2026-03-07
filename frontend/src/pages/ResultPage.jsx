@@ -139,11 +139,6 @@ function ScreenshotModal({ src, onClose }) {
                     borderRadius: '50%', background: '#ef4444', border: 'none', color: '#fff',
                     cursor: 'pointer', fontSize: 18, lineHeight: 1, display: 'flex', alignItems: 'center', justifyContent: 'center'
                 }}>✕</button>
-                <a href={src} download style={{
-                    position: 'absolute', bottom: -40, left: '50%', transform: 'translateX(-50%)',
-                    background: '#3b82f6', color: '#fff', padding: '6px 16px', borderRadius: 6,
-                    fontSize: 13, textDecoration: 'none', whiteSpace: 'nowrap'
-                }}>⬇ 保存截图</a>
             </div>
         </div>
     )
@@ -155,6 +150,85 @@ function ValidationTab({ result }) {
     const gbResults = s.gb_validation || {}
     const rag = s.ragflow_verification || {}
     const [screenshotSrc, setScreenshotSrc] = useState(null)
+    const [ssLoading, setSsLoading] = useState({})  // { [code]: true/false }
+    const [ssError, setSsError] = useState({})       // { [code]: 'error msg' }
+    const [dlLoading, setDlLoading] = useState({})  // { [code]: true/false }
+    const [dlError, setDlError] = useState({})       // { [code]: 'error msg' }
+
+    async function handleDownloadGb(code, v) {
+        if (v.download_path) {
+            // 已有文件，直接触发浏览器下载
+            const a = document.createElement('a')
+            a.href = v.download_path
+            a.download = v.download_path.split('/').pop() || `GB_${code}.pdf`
+            document.body.appendChild(a)
+            a.click()
+            document.body.removeChild(a)
+            return
+        }
+        if (!v.detail_url) {
+            setDlError(e => ({ ...e, [code]: '无详情页 URL，无法下载' }))
+            return
+        }
+        setDlLoading(l => ({ ...l, [code]: true }))
+        setDlError(e => ({ ...e, [code]: null }))
+        try {
+            const resp = await fetch('/api/download_gb', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ detail_url: v.detail_url, gb_number: code })
+            })
+            const data = await resp.json()
+            if (data.success) {
+                v.download_path = data.download_url
+                const a = document.createElement('a')
+                a.href = data.download_url
+                a.download = data.download_url.split('/').pop() || `GB_${code}.pdf`
+                document.body.appendChild(a)
+                a.click()
+                document.body.removeChild(a)
+            } else {
+                setDlError(e => ({ ...e, [code]: data.error || '下载失败' }))
+            }
+        } catch (err) {
+            setDlError(e => ({ ...e, [code]: '请求失败：' + err.message }))
+        } finally {
+            setDlLoading(l => ({ ...l, [code]: false }))
+        }
+    }
+
+    async function handleTakeScreenshot(code, v) {
+        const detailUrl = v.detail_url
+        if (!detailUrl) {
+            setSsError(e => ({ ...e, [code]: '无详情页 URL，无法截图' }))
+            return
+        }
+        // 若已有截图直接打开
+        if (v.screenshot_path) {
+            setScreenshotSrc(v.screenshot_path)
+            return
+        }
+        setSsLoading(l => ({ ...l, [code]: true }))
+        setSsError(e => ({ ...e, [code]: null }))
+        try {
+            const resp = await fetch('/api/take_screenshot', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ detail_url: detailUrl, gb_number: code })
+            })
+            const data = await resp.json()
+            if (data.success) {
+                v.screenshot_path = data.screenshot_url   // 更新本地缓存
+                setScreenshotSrc(data.screenshot_url)
+            } else {
+                setSsError(e => ({ ...e, [code]: data.error || '截图失败' }))
+            }
+        } catch (err) {
+            setSsError(e => ({ ...e, [code]: '请求失败：' + err.message }))
+        } finally {
+            setSsLoading(l => ({ ...l, [code]: false }))
+        }
+    }
 
     return (
         <div>
@@ -166,7 +240,7 @@ function ValidationTab({ result }) {
                 <h3 className="block-title">检验依据标准一致性</h3>
                 {(() => {
                     // 归一化：去掉 -202X 年份后缀再比较
-                    const normGB = code => code.trim().replace(/-\d{4}$/, '').trim()
+                    const normGB = code => code.trim().replace(/-\s*\d{4}$/, '').trim()
 
                     // 报告的国标编号（原始）
                     const reportCodes = s.gb_codes || []
@@ -187,7 +261,10 @@ function ValidationTab({ result }) {
                     reportCodes.forEach(c => { const k = normGB(c); ensure(k); codeMap.get(k).report = c })
                     ruleCodes.forEach(c => { const k = normGB(c); ensure(k); codeMap.get(k).rules = c })
 
-                    const sorted = [...codeMap.entries()].sort(([a], [b]) => a.localeCompare(b))
+                    // 只保留报告检验结论中有的国标（过滤掉仅细则有、报告无的行）
+                    const sorted = [...codeMap.entries()]
+                        .filter(([, { report }]) => report !== null)
+                        .sort(([a], [b]) => a.localeCompare(b))
                     if (sorted.length === 0) return <div className="info-scrim">暂无标准依据数据</div>
 
                     return (
@@ -234,84 +311,94 @@ function ValidationTab({ result }) {
                                 <tr>
                                     <th style={{ width: 140 }}>标准编号</th>
                                     <th style={{ width: 110 }}>有效性</th>
-                                    <th>详细信息</th>
                                     <th style={{ width: 130 }}>操作</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {Object.entries(gbResults).map(([code, v]) => (
-                                    <tr key={code}>
-                                        <td><strong>{code}</strong></td>
-                                        <td>
-                                            <span className={`badge-sm ${v.passed ? 'success' : 'error'}`}>
-                                                {v.status_text || (v.passed ? '现行有效' : '已废止')}
-                                            </span>
-                                        </td>
-                                        <td style={{ fontSize: 12, color: '#94a3b8' }}>
-                                            {v.publish_date && <div>发布：{v.publish_date}</div>}
-                                            {v.implement_date && <div>实施：{v.implement_date}</div>}
-                                            {v.reasons && v.reasons.length > 0 && (
-                                                <div style={{ color: '#f87171', marginTop: 4 }}>{v.reasons[0]}</div>
-                                            )}
-                                        </td>
-                                        <td>
-                                            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                                                {v.screenshot_path ? (
-                                                    <button className="btn-icon-sm" title="查看截图"
-                                                        onClick={() => setScreenshotSrc(v.screenshot_path)}>
-                                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                                                            <circle cx="8.5" cy="8.5" r="1.5" />
-                                                            <polyline points="21 15 16 10 5 21" />
-                                                        </svg>
+                                {(() => {
+                                    // 去重：同一基础编号（忽略年份后缀）只保留一条，优先保留带年份的
+                                    const normGB = code => code.trim().replace(/-\s*\d{4}$/, '').trim()
+                                    const dedupMap = new Map()
+                                    Object.entries(gbResults).forEach(([code, v]) => {
+                                        const key = normGB(code)
+                                        if (!dedupMap.has(key)) {
+                                            dedupMap.set(key, [code, v])
+                                        } else {
+                                            const [existing] = dedupMap.get(key)
+                                            if (/-\d{4}$/.test(code) && !/-\d{4}$/.test(existing)) {
+                                                dedupMap.set(key, [code, v])
+                                            }
+                                        }
+                                    })
+                                    return [...dedupMap.values()].map(([code, v]) => (
+                                        <tr key={code}>
+                                            <td><strong>{code}</strong></td>
+                                            <td>
+                                                <span className={`badge-sm ${v.passed ? 'success' : 'error'}`}>
+                                                    {v.status_text || (v.passed ? '现行有效' : '已废止')}
+                                                </span>
+                                            </td>
+                                            <td>
+                                                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                                                    {/* 截图按钮：按需截图或查看已有截图 */}
+                                                    <button
+                                                        className="btn-icon-sm"
+                                                        title={v.screenshot_path ? '查看截图' : (v.detail_url ? '截图' : '无详情页，无法截图')}
+                                                        disabled={ssLoading[code] || !v.detail_url}
+                                                        style={(!v.detail_url) ? { opacity: 0.35, cursor: 'default' } : {}}
+                                                        onClick={() => handleTakeScreenshot(code, v)}>
+                                                        {ssLoading[code]
+                                                            ? <span style={{ fontSize: 11 }}>…</span>
+                                                            : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                                <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+                                                                <circle cx="8.5" cy="8.5" r="1.5" />
+                                                                <polyline points="21 15 16 10 5 21" />
+                                                            </svg>
+                                                        }
                                                     </button>
-                                                ) : (
-                                                    <button className="btn-icon-sm" title="无截图" disabled style={{ opacity: 0.35, cursor: 'default' }}>
-                                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                                                            <circle cx="8.5" cy="8.5" r="1.5" />
-                                                            <polyline points="21 15 16 10 5 21" />
-                                                        </svg>
+                                                    {ssError[code] && (
+                                                        <span style={{ fontSize: 11, color: '#f87171', maxWidth: 160 }}>{ssError[code]}</span>
+                                                    )}
+                                                    <button
+                                                        className="btn-icon-sm"
+                                                        title={v.download_path ? '下载截图' : (v.detail_url ? '下载截图' : '无详情页，无法下载')}
+                                                        disabled={dlLoading[code] || !v.detail_url}
+                                                        style={(!v.detail_url) ? { opacity: 0.35, cursor: 'default' } : {}}
+                                                        onClick={() => handleDownloadGb(code, v)}>
+                                                        {dlLoading[code]
+                                                            ? <span style={{ fontSize: 11 }}>…</span>
+                                                            : <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                                                <polyline points="7 10 12 15 17 10" />
+                                                                <line x1="12" y1="15" x2="12" y2="3" />
+                                                            </svg>
+                                                        }
                                                     </button>
-                                                )}
-                                                {v.download_path ? (
-                                                    <a href={v.download_path} download className="btn-icon-sm" title="下载标准文件">
-                                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                                                            <polyline points="7 10 12 15 17 10" />
-                                                            <line x1="12" y1="15" x2="12" y2="3" />
-                                                        </svg>
-                                                    </a>
-                                                ) : (
-                                                    <button className="btn-icon-sm" title="无标准文件" disabled style={{ opacity: 0.35, cursor: 'default' }}>
-                                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                                                            <polyline points="7 10 12 15 17 10" />
-                                                            <line x1="12" y1="15" x2="12" y2="3" />
-                                                        </svg>
-                                                    </button>
-                                                )}
-                                                {v.detail_url ? (
-                                                    <a href={v.detail_url} target="_blank" rel="noreferrer" className="btn-icon-sm" title="查看详情页">
-                                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-                                                            <polyline points="15 3 21 3 21 9" />
-                                                            <line x1="10" y1="14" x2="21" y2="3" />
-                                                        </svg>
-                                                    </a>
-                                                ) : (
-                                                    <button className="btn-icon-sm" title="无详情页" disabled style={{ opacity: 0.35, cursor: 'default' }}>
-                                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                                            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-                                                            <polyline points="15 3 21 3 21 9" />
-                                                            <line x1="10" y1="14" x2="21" y2="3" />
-                                                        </svg>
-                                                    </button>
-                                                )}
-                                            </div>
-                                        </td>
-                                    </tr>
-                                ))}
+                                                    {dlError[code] && (
+                                                        <span style={{ fontSize: 11, color: '#f87171', maxWidth: 160 }}>{dlError[code]}</span>
+                                                    )}
+                                                    {v.detail_url ? (
+                                                        <a href={v.detail_url} target="_blank" rel="noreferrer" className="btn-icon-sm" title="查看详情页">
+                                                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                                                                <polyline points="15 3 21 3 21 9" />
+                                                                <line x1="10" y1="14" x2="21" y2="3" />
+                                                            </svg>
+                                                        </a>
+                                                    ) : (
+                                                        <button className="btn-icon-sm" title="无详情页" disabled style={{ opacity: 0.35, cursor: 'default' }}>
+                                                            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                                                                <polyline points="15 3 21 3 21 9" />
+                                                                <line x1="10" y1="14" x2="21" y2="3" />
+                                                            </svg>
+                                                        </button>
+                                                    )}
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    ))
+                                })()}
                             </tbody>
                         </table>
                     </div>

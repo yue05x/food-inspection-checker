@@ -8,11 +8,11 @@ export default defineConfig({
     // 好处：开发时无需手写完整地址，也不会有跨域问题
     proxy: {
       '/api': {
-        target: 'http://localhost:5000',
+        target: 'http://localhost:5002',
         changeOrigin: true,
       },
       '/static': {
-        target: 'http://localhost:5000',
+        target: 'http://localhost:5002',
         changeOrigin: true,
       }
     }

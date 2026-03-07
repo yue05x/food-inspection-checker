@@ -206,6 +206,86 @@ def process_single_file(file_storage, ocr_engine):
     }
 
 
+    # ── 调试：打印前端渲染所需的关键字段 ──────────────────────────────
+    def _debug_print_summary(s):
+        SEP = "=" * 60
+        print(f"\n{SEP}", flush=True)
+        print("[DEBUG SUMMARY] 前端关键字段分析", flush=True)
+        print(SEP, flush=True)
+
+        # 1. gb_codes（标准一致性 reportCodes）
+        codes = s.get("gb_codes", [])
+        print(f"\n[1] gb_codes（报告检验结论中提取的国标，共 {len(codes)} 个）:", flush=True)
+        for c in codes:
+            print(f"    {c}", flush=True)
+        if not codes:
+            print('    ⚠ 为空！标准一致性表格将显示"暂无标准依据数据"', flush=True)
+
+        # 2. ragflow matched_items → required_basis（标准一致性 ruleCodes）
+        rag = s.get("ragflow_verification", {})
+        matched = rag.get("matched_items", [])
+        import re as _re
+        gb_pat = _re.compile(r"GB(?:\/T|\/Z)?\s*[\d]+[\d.]*(?:-\d{2,4})?", _re.IGNORECASE)
+        rule_codes = []
+        for item in matched:
+            basis = (item.get("required_basis") or "").strip()
+            for m in gb_pat.findall(basis):
+                rule_codes.append(m.replace(" ", " ").strip())
+        rule_codes = list(dict.fromkeys(rule_codes))
+        print(f"\n[2] 细则 required_basis 中提取的国标（共 {len(rule_codes)} 个）:", flush=True)
+        for c in rule_codes:
+            print(f"    {c}", flush=True)
+
+        # 3. 标准一致性：原来会显示哪些行，过滤后保留哪些
+        norm = lambda c: _re.sub(r"-\s*\d{4}$", "", c.strip()).strip()
+        code_map = {}
+        for c in codes:
+            k = norm(c)
+            code_map.setdefault(k, {"report": None, "rules": None})
+            code_map[k]["report"] = c
+        for c in rule_codes:
+            k = norm(c)
+            code_map.setdefault(k, {"report": None, "rules": None})
+            code_map[k]["rules"] = c
+        print(f"\n[3] 标准一致性表格行分析（过滤前 {len(code_map)} 行，过滤后只保留 report 不为空的）:", flush=True)
+        filtered_count = 0
+        for k, v in sorted(code_map.items()):
+            keep = v["report"] is not None
+            tag = "✓ 保留" if keep else "✗ 过滤（报告未引用）"
+            if keep:
+                filtered_count += 1
+            consistent = v["report"] and v["rules"]
+            result = "一致" if consistent else ("细则无要求" if v["report"] and not v["rules"] else "报告未引用")
+            print(f"    [{tag}] 基码={k}  报告={v['report']}  细则={v['rules']}  → {result}", flush=True)
+        print(f"  过滤后剩余 {filtered_count} 行", flush=True)
+
+        # 4. gb_validation（国标文件有效性）
+        gb_val = s.get("gb_validation", {})
+        print(f"\n[4] gb_validation（共 {len(gb_val)} 个 key）:", flush=True)
+        seen_norm = {}
+        for code, v in gb_val.items():
+            k = norm(code)
+            dup_tag = ""
+            if k in seen_norm:
+                dup_tag = f"  ⚠ 与 '{seen_norm[k]}' 重复（同一基码，前端将去重）"
+            else:
+                seen_norm[k] = code
+            passed = v.get('passed')
+            status = v.get('status_text', '未知')
+            publish = v.get('publish_date') or '❌未获取'
+            implement = v.get('implement_date') or '❌未获取'
+            abolish = v.get('abolish_date') or ('❌未获取' if not passed else '无（现行有效）')
+            screenshot = v.get('screenshot_path') or '无'
+            flag = '✓' if passed else '✗'
+            print(f"  {flag} {code}  [{status}]{dup_tag}", flush=True)
+            print(f"      发布={publish}  实施={implement}  废止={abolish}", flush=True)
+            print(f"      screenshot={screenshot}", flush=True)
+
+        print(f"\n{SEP}\n", flush=True)
+
+    _debug_print_summary(summary)
+    # ────────────────────────────────────────────────────────────────
+
     pdf_url = url_for("static", filename=f"uploads/{safe_name}")
 
     return {
@@ -887,8 +967,100 @@ def check_gb_validity():
         }), 500
 
 
+@app.route("/api/download_gb", methods=["POST"])
+def download_gb():
+    """
+    按需下载国标文件
+
+    请求格式：{ "detail_url": "https://...", "gb_number": "2763-2021" }
+    返回格式：{ "success": true, "download_url": "/static/downloads/..." }
+             或 { "success": false, "error": "..." }
+    """
+    try:
+        data = request.get_json() or {}
+        detail_url = data.get("detail_url", "").strip()
+        gb_number = data.get("gb_number", "unknown").strip()
+
+        if not detail_url:
+            return jsonify({"success": False, "error": "缺少 detail_url"}), 400
+
+        from gb_verifier.html_extractor import fetch_detail_page_content
+        from gb_verifier.download import download_standard_from_html
+
+        try:
+            html_content = fetch_detail_page_content(detail_url, timeout=30)
+        except Exception as e:
+            return jsonify({"success": False, "error": f"获取详情页失败：{e}"}), 500
+
+        download_dir = os.path.join("static", "downloads")
+        os.makedirs(download_dir, exist_ok=True)
+
+        success, dl_path, err = download_standard_from_html(
+            html=html_content,
+            gb_number=gb_number,
+            download_dir=download_dir,
+            referer=detail_url,
+        )
+        if success:
+            download_url = "/" + dl_path.replace(os.sep, "/")
+            return jsonify({"success": True, "download_url": download_url})
+        else:
+            return jsonify({"success": False, "error": err or "下载失败"}), 500
+
+    except Exception as e:
+        import traceback
+        return jsonify({"success": False, "error": str(e),
+                        "traceback": traceback.format_exc()}), 500
+
+
+@app.route("/api/take_screenshot", methods=["POST"])
+def take_screenshot():
+    """
+    按需截取国标详情页截图
+
+    请求格式：{ "detail_url": "https://...", "gb_number": "2763-2021" }
+    返回格式：{ "success": true, "screenshot_url": "/static/screenshots/..." }
+             或 { "success": false, "error": "..." }
+    """
+    try:
+        data = request.get_json() or {}
+        detail_url = data.get("detail_url", "").strip()
+        gb_number = data.get("gb_number", "unknown").strip()
+
+        if not detail_url:
+            return jsonify({"success": False, "error": "缺少 detail_url"}), 400
+
+        from gb_verifier.screenshot import screenshot_detail_page, PLAYWRIGHT_AVAILABLE
+        if not PLAYWRIGHT_AVAILABLE:
+            return jsonify({
+                "success": False,
+                "error": "Playwright 未安装。请在 backend 目录执行：\n"
+                         ".venv\\Scripts\\pip install playwright\n"
+                         ".venv\\Scripts\\python -m playwright install chromium"
+            }), 500
+
+        screenshot_dir = os.path.join("static", "screenshots")
+        os.makedirs(screenshot_dir, exist_ok=True)
+
+        success, path, err = screenshot_detail_page(
+            detail_url=detail_url,
+            gb_number=gb_number,
+            screenshot_dir=screenshot_dir,
+        )
+        if success:
+            screenshot_url = "/" + path.replace(os.sep, "/")
+            return jsonify({"success": True, "screenshot_url": screenshot_url})
+        else:
+            return jsonify({"success": False, "error": err or "截图失败"}), 500
+
+    except Exception as e:
+        import traceback
+        return jsonify({"success": False, "error": str(e),
+                        "traceback": traceback.format_exc()}), 500
+
+
 if __name__ == "__main__":
     # Force port 5002 to avoid conflict
     port = int(os.environ.get("PORT", 5002))
     print(f"[DEBUG] Starting Flask server on port {port}...", flush=True)
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=True, threaded=True)

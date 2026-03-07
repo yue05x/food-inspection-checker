@@ -173,25 +173,35 @@ def extract_gb_standards(report: Dict[str, Any]) -> List[str]:
                 seen.add(value)
                 standards.append(value)
 
+    # 评价性关键词：只有同时出现这些词，才说明该行是"判定依据"而非"检测方法"
+    BASIS_KEYWORDS = ["符合", "依据", "要求", "不符合", "按照"]
+
+    def _is_basis_line(text: str) -> bool:
+        """判断文本是否像一个"评价依据"句，而非单纯的方法引用行。"""
+        return any(kw in text for kw in BASIS_KEYWORDS)
+
     # 按页处理：OCR 扫描件中结论关键字与国标号常常出现在相邻行，
     # 使用滑动窗口将关键字所在行及其后 CONCLUSION_WINDOW 行一并扫描。
     for page in report.get("pages", []):
         lines = [ln.strip() for ln in (page.get("text_lines", []) or []) if ln.strip()]
         for i, line in enumerate(lines):
             if any(kw in line for kw in CONCLUSION_KEYWORDS) or "经抽样检验" in line:
-                # 当前行 + 后续若干行都纳入扫描（覆盖 OCR 断行情况）
-                for wline in lines[i: i + CONCLUSION_WINDOW + 1]:
-                    if "GB" in wline:
+                for j, wline in enumerate(lines[i: i + CONCLUSION_WINDOW + 1]):
+                    if "GB" not in wline:
+                        continue
+                    # 触发行本身直接收录；后续窗口行需含评价性词语才收录
+                    if j == 0 or _is_basis_line(wline):
                         _add_from_text(wline)
 
-        # 表格：逐行检查含结论关键字的单元格
+        # 表格：只提取"评价结论"性质的单元格里的 GB 码
+        # 含"判定/结论"列但同时含评价性词语（符合/依据/要求）才视为评价依据
         for table in (page.get("tables", []) or []):
             for row in table:
                 row_text = " ".join(str(cell) for cell in row)
                 if "GB" in row_text and (
                     any(kw in row_text for kw in CONCLUSION_KEYWORDS)
                     or "经抽样检验" in row_text
-                ):
+                ) and _is_basis_line(row_text):
                     _add_from_text(row_text)
 
     return standards

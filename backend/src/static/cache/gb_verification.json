@@ -1,0 +1,86 @@
+{
+  "GB 23200.121_2025-05-26": {
+    "passed": false,
+    "status": "obsolete",
+    "status_text": "已废止",
+    "publish_date": null,
+    "implement_date": null,
+    "abolish_date": null,
+    "detail_url": "https://down.foodmate.net/standard/sort/3/97823.html",
+    "screenshot_path": null,
+    "download_path": null,
+    "reasons": [
+      "标准状态不是现行有效（当前为：已废止）",
+      "缺少实施日期（implement_date）"
+    ],
+    "error": null,
+    "timestamp": 1772814149.0712569
+  },
+  "GB 2763-2021_2025-05-26": {
+    "passed": false,
+    "status": "obsolete",
+    "status_text": "已废止",
+    "publish_date": "2021-03-03",
+    "implement_date": "2021-09-03",
+    "abolish_date": null,
+    "detail_url": "https://down.foodmate.net/standard/sort/3/131870.html",
+    "screenshot_path": null,
+    "download_path": null,
+    "reasons": [
+      "标准状态不是现行有效（当前为：已废止）"
+    ],
+    "error": null,
+    "timestamp": 1772814149.7677538
+  },
+  "GB 23200.113_2025-05-26": {
+    "passed": false,
+    "status": "obsolete",
+    "status_text": "已废止",
+    "publish_date": null,
+    "implement_date": null,
+    "abolish_date": null,
+    "detail_url": "https://down.foodmate.net/standard/sort/3/53165.html",
+    "screenshot_path": null,
+    "download_path": null,
+    "reasons": [
+      "标准状态不是现行有效（当前为：已废止）",
+      "缺少实施日期（implement_date）"
+    ],
+    "error": null,
+    "timestamp": 1772814253.9715014
+  },
+  "GB 23200.113- 2018_2025-05-26": {
+    "passed": false,
+    "status": "obsolete",
+    "status_text": "已废止",
+    "publish_date": null,
+    "implement_date": null,
+    "abolish_date": null,
+    "detail_url": "https://down.foodmate.net/standard/sort/3/53165.html",
+    "screenshot_path": null,
+    "download_path": null,
+    "reasons": [
+      "标准状态不是现行有效（当前为：已废止）",
+      "缺少实施日期（implement_date）"
+    ],
+    "error": null,
+    "timestamp": 1772814324.9752786
+  },
+  "GB 23200.121- 2021_2025-05-26": {
+    "passed": false,
+    "status": "obsolete",
+    "status_text": "已废止",
+    "publish_date": null,
+    "implement_date": null,
+    "abolish_date": null,
+    "detail_url": "https://down.foodmate.net/standard/sort/3/97823.html",
+    "screenshot_path": null,
+    "download_path": null,
+    "reasons": [
+      "标准状态不是现行有效（当前为：已废止）",
+      "缺少实施日期（implement_date）"
+    ],
+    "error": null,
+    "timestamp": 1772814325.7785797
+  }
+}
