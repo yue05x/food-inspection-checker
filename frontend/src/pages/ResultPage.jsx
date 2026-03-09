@@ -53,7 +53,6 @@ function calculateModulesStatus(s) {
         { id: 'validation', title: '评价依据合理性', status: basisStatus, desc: '判定依据标准是否与细则一致' },
         { id: 'method_compliance', title: '检测方法合规性', status: s.method_compliance_status || 'unknown', desc: '检测方法是否合规有效' },
         { id: 'standard_compliance', title: '标准指标合理性', status: stdStatus, desc: '标准限量是否满足要求' },
-        { id: 'sample_check', title: '样品信息核对', status: s.sample_info_status || 'unknown', desc: '样品信息与委托单是否一致' },
         { id: 'package', title: '标签信息', status: labelStatus, desc: '产品标签信息是否完整' },
     ]
 
@@ -754,30 +753,6 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
 }
 
 
-/* ───────── 样品信息核对 Tab ───────── */
-function SampleCheckTab({ result }) {
-    const additional = (result.summary || {}).additional_files || {}
-    const protocols = additional.protocols || []
-
-    return (
-        <div className="section-block">
-            <h3 className="block-title">样品信息核对</h3>
-            {protocols.length > 0 ? (
-                protocols.map((p, i) => (
-                    <div key={i} style={{ background: 'rgba(255,255,255,0.05)', borderRadius: 8, padding: 16, marginBottom: 12 }}>
-                        <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>{p.filename}</div>
-                        <a href={p.file_url} target="_blank" rel="noreferrer" style={{ color: '#3b82f6', fontSize: 13 }}>查看委托单</a>
-                    </div>
-                ))
-            ) : (
-                <div className="info-scrim">
-                    <p>暂未上传委托单。点击左侧文件名旁的 <strong>+</strong> 按钮上传委托单。</p>
-                </div>
-            )}
-        </div>
-    )
-}
-
 /* ───────── 标签信息 Tab ───────── */
 function PackageTab({ result }) {
     const additional = (result.summary || {}).additional_files || {}
@@ -873,7 +848,6 @@ const TABS = [
     { id: 'validation', label: '评价依据合理性' },
     { id: 'method_compliance', label: '检测方法合理性' },
     { id: 'standard_compliance', label: '标准指标合理性' },
-    { id: 'sample_check', label: '样品信息核对' },
     { id: 'package', label: '标签信息' },
 ]
 
@@ -887,8 +861,6 @@ export default function ResultPage() {
     const [pdfPage, setPdfPage] = useState(1)          // 当前 PDF 页码
     const appendInputRef = useRef(null)
     const hiddenFileInputRef = useRef(null)
-    const [uploadType, setUploadType] = useState(null)
-    const [dropdownIdx, setDropdownIdx] = useState(null)  // 当前展开下拉的文件索引
     const [previewWidth, setPreviewWidth] = useState(42) // 默认 42vw 宽度
     const [sidebarWidth, setSidebarWidth] = useState(260) // 默认 260px 宽度
 
@@ -986,21 +958,19 @@ export default function ResultPage() {
         if (appendInputRef.current) appendInputRef.current.value = ''
     }
 
-    /* 附加信息上传（委托单/标签） */
+    /* 附加信息上传（标签） */
     const handleAttachFile = async (file) => {
-        if (!file || !uploadType) return
-        const api = uploadType === 'protocol' ? '/api/upload_protocol' : '/api/upload_label_info'
+        if (!file) return
         const formData = new FormData()
         formData.append('file', file)
         try {
-            const res = await fetch(api, { method: 'POST', body: formData })
+            const res = await fetch('/api/upload_label_info', { method: 'POST', body: formData })
             const data = await res.json()
             if (data.success) {
                 const updated = results.map((r, i) => {
                     if (i !== currentIndex) return r
-                    const af = r.summary.additional_files || { protocols: [], labels: [] }
-                    if (uploadType === 'protocol') af.protocols = [...(af.protocols || []), data.data]
-                    else af.labels = [...(af.labels || []), data.data]
+                    const af = r.summary.additional_files || { labels: [] }
+                    af.labels = [...(af.labels || []), data.data]
                     return { ...r, summary: { ...r.summary, additional_files: af } }
                 })
                 setResults(updated)
@@ -1059,42 +1029,13 @@ export default function ResultPage() {
                                         </div>
                                     </div>
                                     <div style={{ position: 'relative' }}>
-                                        <button className="btn-icon-sm" title="上传附加信息"
-                                            onClick={e => { e.stopPropagation(); setDropdownIdx(dropdownIdx === i ? null : i) }}
+                                        <button className="btn-icon-sm" title="上传标签图片"
+                                            onClick={e => { e.stopPropagation(); setCurrentIndex(i); hiddenFileInputRef.current?.click() }}
                                             style={{ marginLeft: 4 }}>
                                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                                                 <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
                                             </svg>
                                         </button>
-                                        {dropdownIdx === i && (
-                                            <div style={{
-                                                position: 'absolute', right: 0, top: '110%', zIndex: 999,
-                                                background: 'var(--color-surface)', border: '1px solid var(--color-border)',
-                                                borderRadius: 8, boxShadow: '0 8px 24px rgba(0,0,0,.5)',
-                                                minWidth: 120, overflow: 'hidden'
-                                            }}>
-                                                {[
-                                                    { label: '委托单', type: 'protocol' },
-                                                    { label: '标签图片', type: 'label' }
-                                                ].map(opt => (
-                                                    <button key={opt.type}
-                                                        style={{
-                                                            display: 'block', width: '100%', textAlign: 'left',
-                                                            padding: '9px 14px', background: 'none', border: 'none',
-                                                            color: 'var(--color-text)', fontSize: 13, cursor: 'pointer'
-                                                        }}
-                                                        onMouseDown={e => e.stopPropagation()}
-                                                        onClick={e => {
-                                                            e.stopPropagation()
-                                                            setUploadType(opt.type)
-                                                            setDropdownIdx(null)
-                                                            hiddenFileInputRef.current?.click()
-                                                        }}>
-                                                        {opt.label}
-                                                    </button>
-                                                ))}
-                                            </div>
-                                        )}
                                     </div>
                                 </li>
                             ))}
@@ -1144,7 +1085,6 @@ export default function ResultPage() {
                         {tab === 'validation' && <ValidationTab result={result} />}
                         {tab === 'method_compliance' && <MethodComplianceTab result={result} onJumpToPdf={jumpToPdf} />}
                         {tab === 'standard_compliance' && <StandardComplianceTab result={result} onJumpToPdf={jumpToPdf} />}
-                        {tab === 'sample_check' && <SampleCheckTab result={result} />}
                         {tab === 'package' && <PackageTab result={result} />}
                     </div>
                 </section>
