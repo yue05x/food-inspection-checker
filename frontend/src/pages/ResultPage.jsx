@@ -220,13 +220,14 @@ function calculateModulesStatus(s, overrides = {}) {
     const ragComp = s.ragflow_verification || {}
     const missingComp = ragComp.missing_items || []
     const conditionalComp = ragComp.conditional_items || []
-    const unresolvedCondComp = conditionalComp.filter(item => overrides[item.name] !== 'allowed').length
+    const unresolvedCondComp = conditionalComp.filter(item => !overrides[item.name]).length
+    const rejectedCondComp   = conditionalComp.filter(item => overrides[item.name] === 'rejected').length
     let stdComplianceStatus
     if (unresolvedCondComp > 0) {
         // 有待人工确认的有条件项，无论是否同时存在缺失，先标为待审核
         stdComplianceStatus = 'pending_review'
-    } else if (missingComp.length > 0) {
-        // 有条件项已全部解决（或本就没有），但存在真正缺失的项目 → 未通过
+    } else if (missingComp.length > 0 || rejectedCondComp > 0) {
+        // 有条件项已全部解决（或本就没有），但存在真正缺失或被拒绝的项目 → 未通过
         stdComplianceStatus = 'failed'
     } else {
         // 无缺失，有条件项全部已允许通过（或本就没有）→ 以后端状态为准
@@ -655,9 +656,10 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
 
     const totalRules = matched.length + missing.length + conditional.length
 
-    // 统计各类数量（缺失项不可人工覆盖，直接计实际数量）
-    const allowedConditionalCount = conditional.filter(item => overrides[item.name] === 'allowed').length
-    const unresolvedConditionalCount = conditional.filter(item => overrides[item.name] !== 'allowed').length
+    // 统计各类数量
+    const allowedConditionalCount   = conditional.filter(item => overrides[item.name] === 'allowed').length
+    const rejectedConditionalCount  = conditional.filter(item => overrides[item.name] === 'rejected').length
+    const unresolvedConditionalCount = conditional.filter(item => !overrides[item.name]).length
     const effectiveMatchedCount = matched.length + allowedConditionalCount
 
     const evidencePages = [...new Set(
@@ -704,7 +706,7 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
             <div style={{ marginBottom: 12, fontSize: 13, color: '#94a3b8' }}>
                 细则要求 <strong style={{ color: '#e2e8f0' }}>{totalRules}</strong> 项 ·
                 已匹配 <strong style={{ color: '#4ade80' }}>{effectiveMatchedCount}</strong> 项 ·
-                报告缺失 <strong style={{ color: missing.length > 0 ? '#f87171' : '#4ade80' }}>{missing.length}</strong> 项
+                报告缺失 <strong style={{ color: (missing.length + rejectedConditionalCount) > 0 ? '#f87171' : '#4ade80' }}>{missing.length + rejectedConditionalCount}</strong> 项
                 {allowedConditionalCount > 0 && <> · 条件已确认 <strong style={{ color: '#4ade80' }}>{allowedConditionalCount}</strong> 项</>}
                 {unresolvedConditionalCount > 0 && <> · 待审核 <strong style={{ color: '#fbbf24' }}>{unresolvedConditionalCount}</strong> 项</>} ·
                 细则外 <strong style={{ color: '#fbbf24' }}>{extra.length}</strong> 项
@@ -754,27 +756,34 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
                             </tr>
                         ))}
                         {conditional.map((item, i) => {
-                            const isAllowed = overrides[item.name] === 'allowed'
+                            const decision   = overrides[item.name]  // 'allowed' | 'rejected' | undefined
+                            const isAllowed  = decision === 'allowed'
+                            const isRejected = decision === 'rejected'
+                            const rowBg = isAllowed  ? 'rgba(74,222,128,0.05)'
+                                        : isRejected ? 'rgba(239,68,68,0.05)'
+                                        : 'rgba(251,191,36,0.05)'
+                            const setDecision = (val) => setOverrides(prev => ({ ...prev, [item.name]: val }))
+                            const clearDecision = () => setOverrides(prev => { const n = { ...prev }; delete n[item.name]; return n })
                             return (
-                                <tr key={`cond-${i}`} style={{ background: isAllowed ? 'rgba(74,222,128,0.05)' : 'rgba(251,191,36,0.05)' }}>
+                                <tr key={`cond-${i}`} style={{ background: rowBg }}>
                                     <td style={{ color: '#64748b', fontSize: 12, textAlign: 'center' }}>{matched.length + missing.length + i + 1}</td>
                                     <td>
                                         {item.name}
-                                        {!isAllowed && <span style={{ marginLeft: 4, fontSize: 11, color: '#fbbf24' }}>⚠</span>}
+                                        {!decision && <span style={{ marginLeft: 4, fontSize: 11, color: '#fbbf24' }}>⚠</span>}
                                     </td>
                                     <td style={{ color: '#94a3b8', fontSize: 12 }}>{item.condition || '有条件才需检测'}</td>
                                     <td>–</td>
                                     <td>
-                                        {isAllowed
-                                            ? <span className="badge-sm success">✅ 条件满足</span>
-                                            : <span className="badge-sm warning">⚠ 有条件</span>
+                                        {isAllowed  && <span className="badge-sm success" style={{ marginRight: 6 }}>条件匹配</span>}
+                                        {isRejected && <span className="badge-sm error"   style={{ marginRight: 6 }}>❌ 报告缺失</span>}
+                                        {!decision  && <span className="badge-sm warning" style={{ marginRight: 6 }}>⚠ 有条件</span>}
+                                        {decision
+                                            ? <button style={overrideBtnStyle(false)} onClick={clearDecision}>撤销</button>
+                                            : <>
+                                                <button style={overrideBtnStyle(false)} onClick={() => setDecision('allowed')}>允许通过</button>
+                                                <button style={{ ...overrideBtnStyle(false), marginLeft: 4, borderColor: '#f87171', color: '#f87171' }} onClick={() => setDecision('rejected')}>不允许通过</button>
+                                              </>
                                         }
-                                        <button
-                                            style={overrideBtnStyle(isAllowed)}
-                                            title={isAllowed ? '撤销允许' : '确认条件满足，标记为已匹配'}
-                                            onClick={() => toggleOverride(item.name)}>
-                                            {isAllowed ? '撤销' : '允许通过'}
-                                        </button>
                                     </td>
                                 </tr>
                             )
