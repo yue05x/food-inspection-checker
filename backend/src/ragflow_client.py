@@ -1,7 +1,10 @@
+import logging
 import requests
 import json
 import re
 from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 class RAGFlowClient:
     def __init__(self, api_url: str, api_key: str, kb_id: str):
@@ -20,8 +23,7 @@ class RAGFlowClient:
             "Content-Type": "application/json"
         }
         
-        # 调试输出
-        print(f"RAGFlowClient 初始化: URL={self.api_url}, KB_ID={self.kb_id}")
+        logger.info("RAGFlowClient 初始化: URL=%s, KB_ID=%s", self.api_url, self.kb_id)
 
     def query_inspection_items(self, food_name: str, custom_query: str = None) -> List[Dict[str, Any]]:
         """
@@ -102,24 +104,16 @@ class RAGFlowClient:
         }
 
         try:
-            print(f"正在查询 RAGFlow: {question}")
-            
-            # 添加重试机制
+            logger.info("RAGFlow 查询: %s", question)
+
             max_retries = 2
             retry_count = 0
             last_error = None
-            
+
             while retry_count <= max_retries:
                 try:
-                    # 调试输出
-                    print(f"DEBUG: 请求 URL: {self.api_url}")
-                    print(f"DEBUG: 请求数据: {json.dumps(data, ensure_ascii=False)}")
-                    print(f"DEBUG: 请求头: {self.headers}")
-                    
-                    # 使用系统代理设置（已配置例外地址），增加超时时间到 60 秒
-                    # 强制绕过代理访问 RagFlow
                     import os
-                    os.environ['NO_PROXY'] = '218.244.149.115,47.110.141.115,localhost,127.0.0.1'
+                    os.environ['NO_PROXY'] = '218.244.149.115,42.121.165.54,42.121.219.127,localhost,127.0.0.1'
 
                     response = requests.post(
                         self.api_url,
@@ -136,32 +130,85 @@ class RAGFlowClient:
                     last_error = e
                     retry_count += 1
                     if retry_count <= max_retries:
-                        print(f"RAGFlow 连接失败,正在重试 ({retry_count}/{max_retries})...")
+                        logger.warning("RAGFlow 连接失败，重试 %d/%d...", retry_count, max_retries)
                         import time
-                        time.sleep(2)  # 等待 2 秒后重试
+                        time.sleep(2)
                     else:
-                        print(f"RAGFlow 连接失败,已达到最大重试次数")
+                        logger.error("RAGFlow 连接失败，已达最大重试次数")
                         raise
             
             if response.status_code == 200:
                 result = response.json()
                 # 检查 RAGFlow 官方 API 响应结构 (code=0 表示成功)
                 if result.get("code") == 0:
-                    # 官方 API 响应格式: {"code": 0, "data": {"chunks": [...], "total": N}}
                     chunks = result.get("data", {}).get("chunks", [])
-                    total = result.get("data", {}).get("total", 0)
-                    print(f"RAGFlow 查询成功: 找到 {len(chunks)} 个结果")
+                    logger.info("RAGFlow 查询成功: %d 个结果 (query=%s)", len(chunks), question[:40])
+                    if not chunks:
+                        logger.debug("RAGFlow 原始响应: %s", str(result)[:300])
                     return self._process_results(chunks)
                 else:
-                    print(f"RAGFlow API 错误: {result}")
+                    logger.warning("RAGFlow API 错误: code=%s msg=%s", result.get("code"), result.get("message", "")[:100])
                     return []
             else:
-                print(f"RAGFlow HTTP 错误: {response.status_code} - {response.text}")
+                logger.error("RAGFlow HTTP %d: %s", response.status_code, response.text[:200])
                 return []
-                
+
         except Exception as e:
-            print(f"RAGFlow 请求异常: {str(e)}")
+            logger.error("RAGFlow 请求异常: %s", e)
             return []
+
+    def get_document_chunks(self, document_id: str, dataset_id: str = None,
+                            page_size: int = 128) -> List[Dict[str, Any]]:
+        """
+        通过 document_id 拉取某文档的全部 chunk（分页合并）。
+        用于获取大型检验项目表格的所有续页 chunk，不依赖向量相似度排名。
+        API: GET /v1/datasets/{dataset_id}/documents/{document_id}/chunks
+        """
+        kb = dataset_id or self.kb_id
+        # 从检索 URL 推断 API 基础路径: ".../api/v1/retrieval" -> ".../api/v1"
+        base = self.api_url.rsplit('/retrieval', 1)[0]
+        url = f"{base}/datasets/{kb}/documents/{document_id}/chunks"
+
+        all_chunks: List[Dict[str, Any]] = []
+        page = 1
+        try:
+            while True:
+                import os
+                os.environ['NO_PROXY'] = '218.244.149.115,42.121.165.54,42.121.219.127,localhost,127.0.0.1'
+                resp = requests.get(
+                    url,
+                    headers=self.headers,
+                    params={"page": page, "page_size": page_size},
+                    timeout=30,
+                    proxies={'http': None, 'https': None}
+                )
+                if resp.status_code != 200:
+                    logger.warning("get_document_chunks HTTP %d", resp.status_code)
+                    break
+                result = resp.json()
+                if result.get("code") != 0:
+                    logger.warning("get_document_chunks API error: %s", result.get("message", ""))
+                    break
+                data = result.get("data", {})
+                chunks = data.get("chunks", [])
+                if not chunks:
+                    break
+                # 该接口 chunk 字段名与检索 API 略有差异，统一映射
+                for c in chunks:
+                    if "content_with_weight" in c and not c.get("content"):
+                        c["content"] = c["content_with_weight"]
+                    if "id" in c and not c.get("chunk_id"):
+                        c["chunk_id"] = c["id"]
+                    c.setdefault("similarity", 1.0)  # 文档直取，无相似度分，给默认值
+                all_chunks.extend(self._process_results(chunks))
+                total = data.get("total", 0)
+                if len(all_chunks) >= total or len(chunks) < page_size:
+                    break
+                page += 1
+            logger.info("get_document_chunks: doc=%s 共 %d chunks", document_id[:16], len(all_chunks))
+        except Exception as e:
+            logger.warning("get_document_chunks 失败 (doc=%s): %s", document_id[:16], e)
+        return all_chunks
 
     def _process_results(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -217,6 +264,6 @@ def get_ragflow_client(config: Dict[str, Any]) -> Optional[RAGFlowClient]:
         if api_url and api_key and kb_id:
             _ragflow_client = RAGFlowClient(api_url, api_key, kb_id)
         else:
-            print("RAGFlow 配置不完整，无法初始化客户端")
+            logger.warning("RAGFlow 配置不完整，无法初始化客户端")
             
     return _ragflow_client

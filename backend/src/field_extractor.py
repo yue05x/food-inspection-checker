@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 DATE_KEYWORDS = ["生产日期", "生产/加工日期", "生产/包装日期", "生产检验日期"]
 NAME_KEYWORDS = ["样品名称", "食品名称", "产品名称"]
+
+# 这些词出现在名称字段中说明 OCR 提取到了非食品名（标签名、修饰词等），应跳过
+_INVALID_NAME_TOKENS = {"商标", "规格", "型号", "批号", "数量", "产地", "生产", "厂家", "检验", "报告", "编号"}
 CONCLUSION_KEYWORDS = ["检验结论", "结论", "判定"]
 
 DATE_PATTERNS = [
@@ -85,6 +91,49 @@ def extract_production_date(report: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _truncate_at_next_field(value: str) -> str:
+    """
+    OCR 常把相邻表格列合并成一行，例如：
+      '贝因美爱加较大婴儿配方奶粉（6-12月龄，2段）生产(加工/购进...)日期'
+    本函数在碰到下一个字段标签时截断，只保留食品名部分。
+    """
+    # 匹配下一个字段标签（中文字词后跟括号/冒号/换行）
+    cut = re.search(
+        r'(?:生产|商标|规格|型号|批号|数量|产地|厂家|检验|报告|编号|日期|委托|受检|抽样)',
+        value
+    )
+    if cut:
+        value = value[:cut.start()].strip().rstrip('（(')
+    # 同时去掉换行及其后的内容
+    value = value.split('\n')[0].strip()
+    return value
+
+
+def _is_valid_food_name(value: str) -> bool:
+    """判断提取到的值是否像一个真实的食品名称。"""
+    if not value or len(value) < 2:
+        return False
+    clean = value.strip()
+    # 含换行说明 OCR 把多个表格单元格合并了，不是真实食品名
+    if '\n' in clean or '\r' in clean:
+        return False
+    # 含"日期"说明抓到了日期字段标签
+    if '日期' in clean:
+        return False
+    # 用正则提取第一个纯中文词（不被括号、斜杠截断）
+    m = re.match(r'[\u4e00-\u9fa5a-zA-Z]+', clean)
+    first_word = m.group(0) if m else clean[:4]
+    if first_word in _INVALID_NAME_TOKENS:
+        return False
+    # 超过 50 字符基本是合并了多个字段的乱码
+    if len(clean) > 50:
+        return False
+    # 纯数字或纯英文不是食品名
+    if re.match(r'^[\d\s]+$', clean) or re.match(r'^[A-Za-z\s]+$', clean):
+        return False
+    return True
+
+
 def extract_food_name(report: Dict[str, Any]) -> Optional[str]:
     """Extract food/sample name from text lines and tables."""
     # 文本行：关键字 + 冒号后的部分
@@ -93,12 +142,19 @@ def extract_food_name(report: Dict[str, Any]) -> Optional[str]:
             if kw in line:
                 parts = re.split(r"[：:]", line, maxsplit=1)
                 if len(parts) > 1:
-                    value = parts[1].strip()
-                    if value:
+                    value = _truncate_at_next_field(parts[1].strip())
+                    if _is_valid_food_name(value):
                         return value
-                m = re.search(re.escape(kw) + r"\s*([^：:\s]+)", line)
+                    else:
+                        logger.debug("食品名跳过(无效): line=%r  value=%r", line[:60], value[:30])
+                # 没有冒号或冒号后无效时：抓关键字后到行尾
+                m = re.search(re.escape(kw) + r"[：:\s]*(.+)", line)
                 if m:
-                    return m.group(1).strip()
+                    value = _truncate_at_next_field(m.group(1).strip())
+                    if _is_valid_food_name(value):
+                        return value
+                    else:
+                        logger.debug("食品名跳过(无效): line=%r  value=%r", line[:60], value[:30])
 
     # 表格：表头列名匹配
     for table in _iter_tables(report):
@@ -112,9 +168,12 @@ def extract_food_name(report: Dict[str, Any]) -> Optional[str]:
             for row in table[1:]:
                 if target_col < len(row):
                     cell = str(row[target_col]).strip()
-                    if cell:
+                    if _is_valid_food_name(cell):
                         return cell
+                    else:
+                        logger.debug("食品名跳过(表格,无效): cell=%r", cell[:40])
 
+    logger.warning("未能提取食品名称，已扫描所有文本行和表格")
     return None
 
 
@@ -326,7 +385,13 @@ def extract_inspection_items(report: Dict[str, Any]) -> List[Dict[str, Any]]:
             if any(record.get(k) for k in ["item", "value", "standard"]):
                 items.append(record)
 
-        if items:
-            break
+    # 去重：同一项目名+检验结果只保留一条（跨页表格可能重复出现表头行）
+    seen = set()
+    deduped = []
+    for it in items:
+        key = (it.get("item", ""), it.get("value", ""))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(it)
 
-    return items
+    return deduped

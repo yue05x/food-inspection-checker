@@ -7,6 +7,14 @@ from typing import Any, Optional
 
 YMD_PATTERN = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
+STATUS_BY_GIF = {
+    "jjss.gif": "即将实施",
+    "xxyx.gif": "现行有效",
+    "bfyx.gif": "部分有效",
+    "jjfz.gif": "即将废止",
+    "yjfz.gif": "已经废止",
+}
+
 
 def _first_match(pattern: re.Pattern[str], text: str) -> Optional[str]:
     m = pattern.search(text)
@@ -52,22 +60,9 @@ def extract_status_for_gb(raw_text: str, gb_number: str) -> Optional[str]:
     if idx == -1:
         return None
     window = raw_text[max(0, idx - 400) : idx + 400]
-    if "yjfz.gif" in window:
-        return "已废止"
-    if "xxyx.gif" in window:
-        return "现行有效"
-        
-    # 增加文本关键字提取 fallback
-    # 搜索结果通常包含: "状态：现行有效" 或 "状态：废止"
-    if "状态：现行" in window or "状态:现行" in window or "现行有效" in window:
-        return "现行有效"
-    if "状态：废止" in window or "状态:废止" in window or "已废止" in window:
-        return "已废止"
-    if "状态：作废" in window or "状态:作废" in window:
-        return "已废止"
-    if "即将实施" in window:
-        return "即将实施"
-        
+    for gif, status in STATUS_BY_GIF.items():
+        if gif in window:
+            return status
     return None
 
 
@@ -76,9 +71,18 @@ def extract_status_from_any(obj: Any) -> Optional[str]:
         s = json.dumps(obj, ensure_ascii=False)
     except Exception:
         s = str(obj)
+    # 优先：图片标志（Foodmate 原始 HTML）
     if "xxyx.gif" in s:
         return "现行有效"
     if "yjfz.gif" in s:
+        return "已废止"
+    # 降级：Tavily 返回 Markdown/纯文本时用文本关键词判断
+    # 注意：仅当明确包含"现行有效"词组时才认定，避免误判
+    if "现行有效" in s:
+        # 确保不同时出现"已废止"，防止搜索结果里废止标准的描述干扰
+        if "已废止" not in s and "作废" not in s:
+            return "现行有效"
+    if "已废止" in s or "作废" in s or "废止日期" in s:
         return "已废止"
     return None
 

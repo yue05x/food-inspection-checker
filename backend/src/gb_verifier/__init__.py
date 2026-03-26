@@ -6,12 +6,15 @@ GB 标准验证包装模块
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # Updated imports to use the local gb_verifier package (relative imports)
 from .config import load_mcp_url
@@ -40,7 +43,7 @@ def _save_cache(cache: dict):
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"Failed to save cache: {e}")
+        logger.warning("缓存保存失败: %s", e)
 
 def _get_cache_key(gb_code: str, production_date: str) -> str:
     return f"{gb_code}_{production_date}"
@@ -66,7 +69,7 @@ def _verify_single_code_logic(
             local_url = search_gb_detail_url(gb_number)
             if local_url:
                 parsed["foodmate_detail_page_url"] = local_url
-                print(f"Local fallback found URL for {gb_number}: {local_url}")
+                logger.info("本地搜索找到 URL: %s -> %s", gb_number, local_url)
         
         detail_url = parsed.get("foodmate_detail_page_url")
         screenshot_path = None
@@ -103,7 +106,7 @@ def _verify_single_code_logic(
                             # 转换为相对于 static 的路径，供前端访问 (必须以 / 开头)
                             screenshot_path = "/" + ss_path.replace(os.sep, "/")
                         else:
-                            print(f"详情页截图失败: {ss_err}")
+                            logger.warning("详情页截图失败: %s", ss_err)
 
                     # 下载功能
                     if enable_download and html_content:
@@ -121,21 +124,34 @@ def _verify_single_code_logic(
                             # 转换为相对于 static 的路径
                             download_path = "/" + dl_path.replace(os.sep, "/")
                         else:
-                            print(f"标准下载失败: {dl_err}")
+                            logger.warning("标准下载失败: %s", dl_err)
 
                 elif error_msg:
-                    print(f"Warning: Failed to fetch detail page for {gb_code}: {error_msg}")
-                    
+                    logger.warning("详情页获取失败 %s: %s", gb_code, error_msg)
+
         except Exception as e:
-            print(f"Warning: Error fetching detail page for {gb_code}: {str(e)}")
-            traceback.print_exc()
+            logger.warning("详情页处理异常 %s: %s", gb_code, e)
         
+        # ── 状态推断兜底：若 status 字段为空，尝试从日期字段推断 ──────────────
+        if not parsed.get("status"):
+            abolish = parsed.get("abolish_date", "")
+            impl    = parsed.get("implement_date", "")
+            if abolish and abolish.strip():
+                parsed["status"] = "已废止"
+                logger.info("状态推断: %s → 已废止（废止日期=%s）", gb_code, abolish)
+            elif impl and impl.strip():
+                parsed["status"] = "现行有效"
+                logger.info("状态推断: %s → 现行有效（实施日期=%s，无废止日期）", gb_code, impl)
+            else:
+                logger.warning("状态推断: %s → 无法推断，缺少日期字段", gb_code)
+        # ────────────────────────────────────────────────────────────────────
+
         # 执行校验
         validation_result = validate_standard_for_production_date(
             production_date=production_date,
             standard_info=parsed
         )
-        
+
         # 格式化结果
         return {
             "passed": validation_result.passed,
@@ -155,12 +171,19 @@ def _verify_single_code_logic(
         }
         
     except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("验证失败 %s: %s\n%s", gb_code, e, tb)
+        try:
+            with open("gb_verify.log", "a") as logf:
+                logf.write(f"[{time.ctime()}] Error {gb_code}: {e}\n{tb}\n")
+        except Exception:
+            pass
         return {
             "passed": False,
             "status": "error",
             "status_text": "验证失败",
             "reasons": [f"验证过程出错: {str(e)}"],
-            "error": traceback.format_exc(),
+            "error": tb,
             "timestamp": time.time()
         }
 
@@ -194,7 +217,7 @@ def verify_gb_standards(
     results = {}
     codes_to_fetch = []
     
-    print(f"DEBUG: verify_gb_standards called with {len(gb_codes)} codes")
+    logger.info("验证国标: %d 个", len(gb_codes))
     
     # 1. 检查缓存
     cache = _load_cache()
@@ -206,18 +229,15 @@ def verify_gb_standards(
         cached_result = cache.get(key)
         
         if cached_result and (current_time - cached_result.get("timestamp", 0) < CACHE_TTL):
-            print(f"DEBUG: Cache hit for {code}")
+            logger.debug("缓存命中: %s", code)
             results[code] = cached_result
-            # 如果缓存里没有 screenshot_path 但现在要求截图，可能需要重新跑？
-            # 简化起见，如果缓存有效直接用。如果用户强行要新截图，怎么处理？
-            # 暂时认为缓存优先。
         else:
-            print(f"DEBUG: Cache miss for {code}, scheduling fetch")
+            logger.debug("缓存未命中: %s", code)
             codes_to_fetch.append(code)
             
     # 2. 并行处理未缓存的项目
     if codes_to_fetch:
-        print(f"Verifying {len(codes_to_fetch)} standards (parallel)...")
+        logger.info("在线验证 %d 个国标（并行）...", len(codes_to_fetch))
         # log to file
         with open("gb_verify.log", "a") as logf:
             logf.write(f"[{time.ctime()}] Verifying: {codes_to_fetch}\n")
@@ -244,12 +264,11 @@ def verify_gb_standards(
                     res = future.result()
                     new_results[code] = res
                     results[code] = res
-                    print(f"DEBUG: Finished verifying {code}, result: {res.get('status')}")
+                    logger.info("验证完成: %s -> %s", code, res.get('status'))
                     with open("gb_verify.log", "a") as logf:
                         logf.write(f"[{time.ctime()}] Finished {code}: {res.get('status')}\n")
                 except Exception as e:
-                    print(f"Error verifying {code}: {e}")
-                    traceback.print_exc()
+                    logger.error("验证异常 %s: %s", code, e)
                     with open("gb_verify.log", "a") as logf:
                         logf.write(f"[{time.ctime()}] Error {code}: {e}\n{traceback.format_exc()}\n")
                     results[code] = {
@@ -261,9 +280,16 @@ def verify_gb_standards(
                     }
         
         # 3. 更新缓存
+        # error 结果可能是临时网络/超时问题，使用 1 小时短 TTL，让下次提交自动重试
+        # 正常结果使用 24 小时 TTL
         if new_results:
             for code, res in new_results.items():
                 key = _get_cache_key(code, production_date)
+                if res.get("status") == "error":
+                    # 使 timestamp 比当前时间早 (CACHE_TTL - 3600) 秒，
+                    # 这样 1 小时后缓存就会过期
+                    res = dict(res)
+                    res["timestamp"] = time.time() - CACHE_TTL + 3600
                 cache[key] = res
             _save_cache(cache)
             

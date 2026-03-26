@@ -5,8 +5,11 @@
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def extract_product_type(ocr_text: str) -> Optional[str]:
@@ -156,8 +159,7 @@ def process_package_image(image_path: str, ocr_engine) -> dict[str, Any]:
                 text = line[1][0] if isinstance(line[1], tuple) else line[1]
                 ocr_text += text + "\n"
 
-    print(f"[OCR] 识别到 {len(ocr_text.splitlines())} 行文本")
-    print(f"[OCR] 原文预览:\n{ocr_text[:500]}")
+    logger.info("OCR 识别: %d 行文本", len(ocr_text.splitlines()))
 
     product_info = {
         "product_type": extract_product_type(ocr_text),
@@ -167,5 +169,5 @@ def process_package_image(image_path: str, ocr_engine) -> dict[str, Any]:
         "raw_text": ocr_text.strip()
     }
 
-    print(f"[OCR] 提取结果: 类型={product_info['product_type']}, 标准={product_info['standard_code']}")
+    logger.info("OCR 提取: 类型=%s, 标准=%s", product_info['product_type'], product_info['standard_code'])
     return product_info

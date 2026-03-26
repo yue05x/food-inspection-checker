@@ -2,6 +2,7 @@ import { useState } from 'react'
 import axios from 'axios'
 import { useNavigate } from 'react-router-dom'
 import DropZone from '../components/DropZone'
+import AdminMenu from '../components/AdminMenu'
 
 export default function UploadPage() {
     const navigate = useNavigate()
@@ -36,6 +37,9 @@ export default function UploadPage() {
 
     return (
         <div className="upload-page-root">
+            <div className="upload-admin-corner">
+                <AdminMenu />
+            </div>
             <div className="upload-container">
 
                 {/* Header */}

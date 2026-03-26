@@ -28,13 +28,13 @@ class PaddleOCREnhanced:
     
     def __init__(self, lang='ch'):
         """初始化 PaddleOCR 引擎"""
-        print("Initializing PaddleOCR Enhanced...")
+        _logger = __import__('logging').getLogger(__name__)
+        _logger.info("初始化 PaddleOCR Enhanced...")
         try:
-            # 使用与原代码相同的参数
             self.ocr = PaddleOCR(use_angle_cls=True, lang=lang)
-            print("[OK] PaddleOCR initialized")
+            _logger.info("PaddleOCR 初始化完成")
         except Exception as e:
-            print(f"[ERROR] Failed to initialize PaddleOCR: {e}")
+            _logger.error("PaddleOCR 初始化失败: %s", e)
             raise
         
         # 初始化辅助模块

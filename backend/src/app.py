@@ -15,6 +15,27 @@ os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["FLAGS_use_mkldnn_kernel"] = "0"
 
+import logging
+
+# 直接操作 root logger，避免被 paddleocr/werkzeug 的 basicConfig 调用覆盖
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+_root.handlers.clear()  # 清除任何已存在的 handler
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [%(levelname)-5s] %(name)s: %(message)s', datefmt='%H:%M:%S'
+))
+_root.addHandler(_handler)
+
+# 压制噪音库（同时清掉它们自己的 handler，彻底静音）
+for _lib in ('urllib3', 'requests', 'werkzeug', 'paddleocr', 'ppocr', 'PIL', 'matplotlib'):
+    _lg = logging.getLogger(_lib)
+    _lg.setLevel(logging.WARNING)
+    _lg.handlers.clear()
+    _lg.propagate = True  # 只让 WARNING+ 通过 root handler 输出
+
+logger = logging.getLogger(__name__)
+
 from flask import Flask, request, redirect, url_for, flash, jsonify
 from flask_cors import CORS
 
@@ -38,6 +59,8 @@ from field_extractor import (
 from ocr_engine import get_ocr_engine
 from pdf_reader import parse_pdf
 
+# ppocr 的 import 会把 root logger level 抬高到 WARNING，在这里重新断言
+logging.getLogger().setLevel(logging.INFO)
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # Go up to PDFInfExtraction directory
 UPLOAD_DIR = BASE_DIR / "static" / "uploads"
@@ -52,28 +75,29 @@ app.secret_key = "change-me-in-production"
 # 允许 React 开发服务器（5173端口）跨域访问所有 /api/ 路由
 CORS(app, resources={r"/api/*": {"origins": ["http://localhost:5173", "http://127.0.0.1:5173"]}})
 
+logger.info("=" * 50)
+logger.info("后端已启动，上传目录: %s", UPLOAD_DIR)
+logger.info("=" * 50)
+
 
 def process_single_file(file_storage, ocr_engine):
     """处理单个上传的PDF文件，返回检测结果和状态"""
     safe_name = Path(file_storage.filename).name
     save_path = UPLOAD_DIR / safe_name
     file_storage.save(save_path)
-    print(f"[DEBUG] Started processing file: {safe_name}", flush=True)
+    logger.info("开始处理文件: %s", safe_name)
 
     report = parse_pdf(str(save_path), ocr_engine=ocr_engine)
-    print(f"[DEBUG] PDF Parsed. Keys: {list(report.keys()) if report else 'None'}", flush=True)
 
     food_name = extract_food_name(report)
     production_date = extract_production_date(report)
     gb_codes = extract_gb_standards(report)
     gb_detail = extract_gb_standards_with_title(report)
     items = extract_inspection_items(report)
-    
-    print(f"[DEBUG] Extracted Info:", flush=True)
-    print(f"  - Food Name: {food_name}", flush=True)
-    print(f"  - Prod Date: {production_date}", flush=True)
-    print(f"  - GB Codes : {gb_codes}", flush=True)
-    print(f"  - Items Count: {len(items) if items else 0}", flush=True)
+
+    logger.info("提取完成: 食品=%s | 日期=%s | 国标=%d个 | 检验项=%d行",
+                food_name or '未识别', production_date or '未识别',
+                len(gb_codes or []), len(items or []))
 
     # 简单的问题检测逻辑：检查必填字段是否缺失
     issues = []
@@ -97,93 +121,75 @@ def process_single_file(file_storage, ocr_engine):
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
 
-    if production_date and gb_codes:
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+    import re as _re
+
+    def _run_gb_validation():
+        if not (production_date and gb_codes):
+            return {}
         try:
-            gb_validation_results = verify_gb_standards(
-                gb_codes=gb_codes,
+            all_codes = list(gb_codes)
+            if items:
+                gb_regex = _re.compile(r"GB(?:/T)?\s*\d+(?:\.\d+)?\s*[—\-‑–－]\s*\d{4}")
+                method_codes = set()
+                for item in items:
+                    for code in gb_regex.findall(item.get("method", "")):
+                        method_codes.add(_re.sub(r'\s+', ' ', code).strip())
+                new_codes = [c for c in method_codes if c not in all_codes]
+                if new_codes:
+                    logger.info("验证检测方法标准: %s", new_codes)
+                    all_codes.extend(new_codes)
+            return verify_gb_standards(
+                gb_codes=all_codes,
                 production_date=production_date,
                 config_path=str(config_path),
-                enable_screenshot=True,  # 自动启用截图
-                enable_download=True     # 自动启用下载
+                enable_screenshot=True,
+                enable_download=True
             )
-            print(f"[DEBUG] GB Validation Results: {json.dumps(gb_validation_results, ensure_ascii=False)[:500]}...", flush=True)
-            
-            # 检查是否有国标验证失败
-            failed_gb_codes = []
-            for code, validation in gb_validation_results.items():
-                if not validation.get("passed", False):
-                    failed_gb_codes.append(code)
-            
-            if failed_gb_codes:
-                issues.append(f"国标验证失败: {', '.join(failed_gb_codes)}")
-                
-            
-            # 2. 提取并验证检测方法中的标准
-            if items:
-                method_codes = set()
-                import re
-                gb_regex = re.compile(r"GB(?:/T)?\s*\d+(?:\.\d+)?\s*[—\-‑–－]\s*\d{4}")
-                
-                for item in items:
-                    method_str = item.get("method", "")
-                    if method_str:
-                         # 提取标准号
-                         matches = gb_regex.findall(method_str)
-                         for code in matches:
-                             # 清理标准号中的换行符和多余空格
-                             clean_code = re.sub(r'\s+', ' ', code).strip()
-                             method_codes.add(clean_code)
-                
-                if method_codes:
-                    # 过滤掉已经验证过的
-                    new_codes = [c for c in method_codes if c not in gb_validation_results]
-                    if new_codes:
-                        print(f"验证检测方法标准: {new_codes}")
-                        method_results = verify_gb_standards(
-                            gb_codes=new_codes,
-                            production_date=production_date,
-                            config_path=str(config_path),
-                            enable_screenshot=True,  # 方法标准也自动截图
-                            enable_download=True     # 方法标准也自动下载
-                        )
-                        # 合并结果
-                        gb_validation_results.update(method_results)
-                        
-                        # 检查方法标准是否有效
-                        for code, validation in method_results.items():
-                            if not validation.get("passed", False):
-                                status_text = validation.get("status_text", "未知")
-                                issues.append(f"检测方法标准 {code} 无效 ({status_text})")
-
         except Exception as e:
-            # 验证失败不影响基本功能
-            print(f"国标验证失败: {e}")
-            
-            # 新增: RAGFlow 检验项目合规性验证
-    if food_name and items:
+            logger.error("国标验证失败: %s", e)
+            return {}
+
+    def _run_ragflow_verification():
+        if not (food_name and items):
+            return {}
         try:
             from ragflow_verifier import verify_inspection_compliance
-            print(f"正在进行 RAGFlow 合规性验证: {food_name}")
-            ragflow_verification = verify_inspection_compliance(
+            logger.info("RAGFlow 合规验证: %s", food_name)
+            return verify_inspection_compliance(
                 food_name=food_name,
                 report_items=items,
-                report_gb_codes=gb_codes,  # 传入提取的标准号列表
+                report_gb_codes=gb_codes,
                 config=config
             )
-            print(f"[DEBUG] RAGFlow Verification Status: {ragflow_verification.get('status')}", flush=True)
-            if ragflow_verification.get('issues'):
-                 print(f"[DEBUG] RAGFlow Issues: {ragflow_verification.get('issues')}", flush=True)
-            
-            # 将 RAGFlow 发现的问题添加到总 issues 中
-            if ragflow_verification.get("status") == "fail":
-                 rag_issues = ragflow_verification.get("issues", [])
-                 for issue in rag_issues:
-                     issues.append(f"[合规性] {issue}")
-                     
         except Exception as e:
-            print(f"RAGFlow 验证失败: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("RAGFlow 验证异常: %s", e)
+            return {}
+
+    # 国标验证 与 RAGFlow验证 并行执行
+    logger.info("RAGFlow 条件检查: food_name=%r  items=%d条", food_name, len(items or []))
+    with _TPE(max_workers=2) as _pool:
+        _fut_gb = _pool.submit(_run_gb_validation)
+        _fut_rf = _pool.submit(_run_ragflow_verification)
+        gb_validation_results = _fut_gb.result()
+        ragflow_verification   = _fut_rf.result()
+
+    # 处理国标验证结果
+    for code, validation in gb_validation_results.items():
+        if not validation.get("passed", False):
+            status_text = validation.get("status_text", "未知")
+            if code in (gb_codes or []):
+                issues.append(f"国标验证失败: {code}")
+            else:
+                issues.append(f"检测方法标准 {code} 无效 ({status_text})")
+
+    # 处理RAGFlow验证结果
+    logger.info("RAGFlow 验证完成: status=%s, issues=%d个",
+                ragflow_verification.get('status'),
+                len(ragflow_verification.get('issues', [])))
+    if ragflow_verification.get("status") == "fail":
+        for issue in ragflow_verification.get("issues", []):
+            issues.append(f"[合规性] {issue}")
 
     
     summary = {
@@ -206,85 +212,11 @@ def process_single_file(file_storage, ocr_engine):
     }
 
 
-    # ── 调试：打印前端渲染所需的关键字段 ──────────────────────────────
-    def _debug_print_summary(s):
-        SEP = "=" * 60
-        print(f"\n{SEP}", flush=True)
-        print("[DEBUG SUMMARY] 前端关键字段分析", flush=True)
-        print(SEP, flush=True)
-
-        # 1. gb_codes（标准一致性 reportCodes）
-        codes = s.get("gb_codes", [])
-        print(f"\n[1] gb_codes（报告检验结论中提取的国标，共 {len(codes)} 个）:", flush=True)
-        for c in codes:
-            print(f"    {c}", flush=True)
-        if not codes:
-            print('    ⚠ 为空！标准一致性表格将显示"暂无标准依据数据"', flush=True)
-
-        # 2. ragflow matched_items → required_basis（标准一致性 ruleCodes）
-        rag = s.get("ragflow_verification", {})
-        matched = rag.get("matched_items", [])
-        import re as _re
-        gb_pat = _re.compile(r"GB(?:\/T|\/Z)?\s*[\d]+[\d.]*(?:-\d{2,4})?", _re.IGNORECASE)
-        rule_codes = []
-        for item in matched:
-            basis = (item.get("required_basis") or "").strip()
-            for m in gb_pat.findall(basis):
-                rule_codes.append(m.replace(" ", " ").strip())
-        rule_codes = list(dict.fromkeys(rule_codes))
-        print(f"\n[2] 细则 required_basis 中提取的国标（共 {len(rule_codes)} 个）:", flush=True)
-        for c in rule_codes:
-            print(f"    {c}", flush=True)
-
-        # 3. 标准一致性：原来会显示哪些行，过滤后保留哪些
-        norm = lambda c: _re.sub(r"-\s*\d{4}$", "", c.strip()).strip()
-        code_map = {}
-        for c in codes:
-            k = norm(c)
-            code_map.setdefault(k, {"report": None, "rules": None})
-            code_map[k]["report"] = c
-        for c in rule_codes:
-            k = norm(c)
-            code_map.setdefault(k, {"report": None, "rules": None})
-            code_map[k]["rules"] = c
-        print(f"\n[3] 标准一致性表格行分析（过滤前 {len(code_map)} 行，过滤后只保留 report 不为空的）:", flush=True)
-        filtered_count = 0
-        for k, v in sorted(code_map.items()):
-            keep = v["report"] is not None
-            tag = "✓ 保留" if keep else "✗ 过滤（报告未引用）"
-            if keep:
-                filtered_count += 1
-            consistent = v["report"] and v["rules"]
-            result = "一致" if consistent else ("细则无要求" if v["report"] and not v["rules"] else "报告未引用")
-            print(f"    [{tag}] 基码={k}  报告={v['report']}  细则={v['rules']}  → {result}", flush=True)
-        print(f"  过滤后剩余 {filtered_count} 行", flush=True)
-
-        # 4. gb_validation（国标文件有效性）
-        gb_val = s.get("gb_validation", {})
-        print(f"\n[4] gb_validation（共 {len(gb_val)} 个 key）:", flush=True)
-        seen_norm = {}
-        for code, v in gb_val.items():
-            k = norm(code)
-            dup_tag = ""
-            if k in seen_norm:
-                dup_tag = f"  ⚠ 与 '{seen_norm[k]}' 重复（同一基码，前端将去重）"
-            else:
-                seen_norm[k] = code
-            passed = v.get('passed')
-            status = v.get('status_text', '未知')
-            publish = v.get('publish_date') or '❌未获取'
-            implement = v.get('implement_date') or '❌未获取'
-            abolish = v.get('abolish_date') or ('❌未获取' if not passed else '无（现行有效）')
-            screenshot = v.get('screenshot_path') or '无'
-            flag = '✓' if passed else '✗'
-            print(f"  {flag} {code}  [{status}]{dup_tag}", flush=True)
-            print(f"      发布={publish}  实施={implement}  废止={abolish}", flush=True)
-            print(f"      screenshot={screenshot}", flush=True)
-
-        print(f"\n{SEP}\n", flush=True)
-
-    _debug_print_summary(summary)
-    # ────────────────────────────────────────────────────────────────
+    logger.info("处理完成: food=%s | gb=%d | matched=%d | issues=%d",
+                summary.get('food_name', '?'),
+                len(summary.get('gb_codes', [])),
+                len(summary.get('ragflow_verification', {}).get('matched_items', [])),
+                len(issues))
 
     pdf_url = url_for("static", filename=f"uploads/{safe_name}")
 
@@ -467,15 +399,13 @@ def upload_label_info():
         # Perform OCR processing
         package_info = {}
         try:
-            print(f"Processing label image for OCR: {save_path}")
+            logger.info("标签图片 OCR: %s", save_path)
             ocr_engine = get_ocr_engine()
             package_info = process_package_image(str(save_path), ocr_engine)
-            print(f"OCR Success. Extracted: {package_info.keys()}")
-            print(f"Product Type: {package_info.get('product_type')}, Standard: {package_info.get('standard_code')}")
+            logger.info("OCR 完成: 类型=%s, 标准=%s",
+                        package_info.get('product_type'), package_info.get('standard_code'))
         except Exception as e:
-            print(f"Error processing package image: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("标签图片处理失败: %s", e)
             package_info = {"raw_text": f"Error: {str(e)}"}
         
         return jsonify({
@@ -576,7 +506,7 @@ def ragflow_query_inspection_items():
                 config = json.load(f)
         else:
             config = {}
-            print(f"配置文件未找到: {config_path}")
+            logger.warning("配置文件未找到: %s", config_path)
 
         # 获取RAGFlow客户端
         ragflow_client = get_ragflow_client(config)
@@ -813,7 +743,7 @@ def api_upload():
     """
     React 前端专用上传接口（返回 JSON）
     """
-    print("[DEBUG] Received POST request at /api/upload", flush=True)
+    logger.info("POST /api/upload")
     files = request.files.getlist("pdfs")
     if not files or all(f.filename == "" for f in files):
         return jsonify({"success": False, "error": "请至少选择一个 PDF 文件"}), 400
@@ -826,7 +756,7 @@ def api_upload():
     if not valid_files:
         return jsonify({"success": False, "error": "没有有效的 PDF 文件"}), 400
 
-    print("[DEBUG] Initializing OCR engine...", flush=True)
+    logger.info("初始化 OCR 引擎...")
     ocr_engine = get_ocr_engine()
 
     results = []
@@ -1059,8 +989,84 @@ def take_screenshot():
                         "traceback": traceback.format_exc()}), 500
 
 
+@app.route("/api/admin/kb_files", methods=["GET"])
+def admin_kb_files():
+    """
+    列出知识库各分类下的真实文件。
+    ?tab=rules | standards | reports | labels
+    """
+    import datetime
+    TAB_DIRS = {
+        "rules":     os.path.join("static", "files"),
+        "standards": os.path.join("static", "downloads"),
+        "reports":   os.path.join("static", "uploads"),
+        "labels":    os.path.join("static", "uploads", "labels"),
+    }
+    # reports 只显示 PDF，labels 只显示图片
+    TAB_EXTS = {
+        "reports": {".pdf"},
+        "labels":  {".jpg", ".jpeg", ".png", ".webp", ".bmp"},
+    }
+    tab = request.args.get("tab", "rules")
+    directory = TAB_DIRS.get(tab)
+    if not directory:
+        return jsonify({"success": False, "error": "未知分类"}), 400
+
+    allowed_exts = TAB_EXTS.get(tab)  # None 表示不过滤
+
+    try:
+        os.makedirs(directory, exist_ok=True)
+        files = []
+        for fname in sorted(os.listdir(directory)):
+            fpath = os.path.join(directory, fname)
+            if not os.path.isfile(fpath):
+                continue
+            if allowed_exts:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in allowed_exts:
+                    continue
+            stat = os.stat(fpath)
+            size_kb = stat.st_size / 1024
+            size_str = f"{size_kb/1024:.1f} MB" if size_kb >= 1024 else f"{size_kb:.0f} KB"
+            mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d")
+            files.append({"name": fname, "size": size_str, "date": mtime})
+        return jsonify({"success": True, "files": files, "count": len(files)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/admin/upload_kb_file", methods=["POST"])
+def admin_upload_kb_file():
+    """
+    上传文件到指定知识库分类目录。
+    表单字段: file (文件), tab (rules | standards | reports | labels)
+    """
+    TAB_DIRS = {
+        "rules":     os.path.join("static", "files"),
+        "standards": os.path.join("static", "downloads"),
+        "reports":   os.path.join("static", "uploads"),
+        "labels":    os.path.join("static", "uploads", "labels"),
+    }
+    tab = request.form.get("tab", "rules")
+    directory = TAB_DIRS.get(tab)
+    if not directory:
+        return jsonify({"success": False, "error": "未知分类"}), 400
+
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return jsonify({"success": False, "error": "未选择文件"}), 400
+
+    try:
+        os.makedirs(directory, exist_ok=True)
+        save_path = os.path.join(directory, file.filename)
+        file.save(save_path)
+        return jsonify({"success": True, "filename": file.filename})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     # Force port 5002 to avoid conflict
     port = int(os.environ.get("PORT", 5002))
-    print(f"[DEBUG] Starting Flask server on port {port}...", flush=True)
+    logger.info("Flask 启动，端口 %d", port)
     app.run(host="0.0.0.0", port=port, debug=True, threaded=True)

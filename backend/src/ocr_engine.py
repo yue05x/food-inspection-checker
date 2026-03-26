@@ -16,4 +16,4 @@ def get_ocr_engine() -> PaddleOCR:
     enable_mkldnn=False 配合顶部环境变量，双重禁用 Intel oneDNN，
     规避 Windows 上 'OneDnnContext does not have the input Filter' RuntimeError。
     """
-    return PaddleOCR(use_angle_cls=True, lang="ch", enable_mkldnn=False, cpu_threads=4)
+    return PaddleOCR(use_angle_cls=True, lang="ch", enable_mkldnn=False, cpu_threads=4, show_log=False)

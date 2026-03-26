@@ -1,19 +1,170 @@
 import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
+import AdminMenu from '../components/AdminMenu'
+
+/* ───────── 指标比较工具函数 ───────── */
+// 标准化字符串：去空格、全角数字、统一分隔符
+const _normStr = s => (s || '').replace(/\s/g, '')
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/[～〜]/g, '~')
+    .replace(/[∶：]/g, ':')
+
+// 解析标准范围字符串 → {min?, max?} 或 null（无法解析返回 null）
+// 支持：≤0.5 / ≥12 / 0.07~0.33 / N.S.a~20
+// 不支持：比值（含":"）、纯文字
+const _parseRange = rawStr => {
+    const n = _normStr(rawStr).replace(/[％%]/g, '')
+    if (!n || /^[–\-]$/.test(n) || /未查到|未找到|未提取/.test(n)) return null
+    if (/:/.test(n)) return null   // 比值格式跳过（如 1.2:1~2:1）
+    let m = n.match(/^[≤<]([\d.]+)/)
+    if (m) return { max: parseFloat(m[1]) }
+    m = n.match(/^[≥>]([\d.]+)/)
+    if (m) return { min: parseFloat(m[1]) }
+    // a~b（兼容前缀文字，如 N.S.a~20 → max=20）
+    const parts = n.split('~')
+    if (parts.length === 2) {
+        const mins = [...parts[0].matchAll(/([\d.]+)/g)].map(x => parseFloat(x[1]))
+        const maxs = [...parts[1].matchAll(/([\d.]+)/g)].map(x => parseFloat(x[1]))
+        if (maxs.length > 0) return { ...(mins.length > 0 ? { min: mins[mins.length - 1] } : {}), max: maxs[maxs.length - 1] }
+    }
+    return null  // 单个纯数字或其他格式 → 语义不明，跳过
+}
+
+// 解析实测值 → 最大数（兼容 "未检出(定量限:0.01)"，跳过多值微生物格式）
+const _parseMeasNum = rawStr => {
+    if (!rawStr || rawStr === '–') return null
+    const n = _normStr(rawStr).replace(/[＜<]/g, '')
+    if (/未检出/.test(n)) return 0
+    if (/:/.test(n)) return null  // 比值格式跳过
+    // 多值（微生物采样）格式交由 _parseNcmM 路径处理，此处不取最大值
+    if (/[,，]/.test(n)) return null
+    const nums = [...n.matchAll(/([\d.]+)/g)].map(x => parseFloat(x[1]))
+    return nums.length ? Math.max(...nums) : null
+}
+
+// ── 食品微生物 n/c/m/M 采样计划工具 ──────────────────────────────────────────
+// 解析 "n=5,c=2,m=1000,M=10000" → {n,c,m,M} 或 null
+const _parseNcmM = s => {
+    if (!s) return null
+    const nm = s.match(/\bn\s*=\s*(\d+)/), cm = s.match(/\bc\s*=\s*(\d+)/)
+    const mm = s.match(/(?<![nNcC])\bm\s*=\s*([\d.]+)/), MM = s.match(/\bM\s*=\s*([\d.]+)/)
+    if (!nm || !cm || !mm || !MM) return null
+    return { n: parseInt(nm[1]), c: parseInt(cm[1]), m: parseFloat(mm[1]), M: parseFloat(MM[1]) }
+}
+
+// 解析逗号分隔的多样品实测值 → [float, ...] 或 null（单值返回 null）
+const _parseMicrobialSamples = s => {
+    if (!s) return null
+    const parts = s.split(/[,，；;]+/).map(p => p.trim()).filter(Boolean)
+    if (parts.length < 2) return null
+    const vals = parts.map(p => {
+        if (/[<＜]/.test(p)) return 0          // <X → 低于检出限
+        if (/未检出|^ND$/i.test(p)) return 0
+        const m = p.match(/([\d.]+)/)
+        return m ? parseFloat(m[1]) : null
+    })
+    return vals.every(v => v !== null) ? vals : null
+}
+
+// n/c/m/M 判定 → 'compliant' | 'inconsistent' | 'unknown'
+const _judgeNcmM = (samples, plan) => {
+    const { c, m, M } = plan
+    let between = 0
+    for (const v of samples) {
+        if (v > M) return 'inconsistent'
+        if (v > m) between++
+    }
+    return between > c ? 'inconsistent' : 'compliant'
+}
+
+// 综合判断一行的合规性
+// 优先：微生物 n/c/m/M 采样计划（菌落总数/大肠菌群/沙门氏菌等）
+// 其次：实测值 vs 国标范围（数值比较）
+// 再次：报告标准范围 ⊆ 国标范围（包含检查）
+// 最后：字符串归一化比较
+// 返回 'compliant' | 'inconsistent' | 'unknown'
+function _checkCompliance(measureVal, reportStd, gbStd) {
+    const NOT_FOUND = new Set(['未找到限量值', '未提取', '未查到', '–', ''])
+    const gbFound = gbStd && !NOT_FOUND.has(gbStd.trim())
+    const repFound = reportStd && !NOT_FOUND.has(reportStd.trim())
+    const measFound = measureVal && measureVal !== '–' && measureVal.trim() !== ''
+
+    // ── 微生物 n/c/m/M 采样计划判定（最优先）──────────────────────────────
+    // 从报告标准列或国标查询结果中检测 n/c/m/M 格式
+    const plan = _parseNcmM(reportStd) || _parseNcmM(gbStd)
+    if (plan && measFound) {
+        const samples = _parseMicrobialSamples(measureVal)
+        if (samples) return _judgeNcmM(samples, plan)
+        // 单值时：要求 ≤ m
+        const sv = _normStr(measureVal).replace(/[<＜]/g, '')
+        const num = parseFloat(sv)
+        if (!isNaN(num)) {
+            if (num > plan.M) return 'inconsistent'
+            if (num > plan.m) return 'unknown'   // 介于 m~M，需全套采样数据
+            return 'compliant'
+        }
+    }
+
+    if (!gbFound) return 'unknown'
+
+    const gbRange = _parseRange(gbStd)
+    const measNum = measFound ? _parseMeasNum(measureVal) : null
+
+    // ① 实测值 vs 国标范围（数值比较）
+    if (measNum !== null && gbRange) {
+        const minOk = gbRange.min === undefined || measNum >= gbRange.min
+        const maxOk = gbRange.max === undefined || measNum <= gbRange.max
+        return (minOk && maxOk) ? 'compliant' : 'inconsistent'
+    }
+
+    // ① 补充：国标是纯数字（无法确定方向），用实测值 + 报告标准方向推断
+    if (measNum !== null && !gbRange) {
+        const gbNumStr = _normStr(gbStd).replace(/[^0-9.]/g, '')
+        const gbNum = gbNumStr ? parseFloat(gbNumStr) : NaN
+        if (!isNaN(gbNum)) {
+            // 精确匹配（如沙门氏菌 未检出=0 vs 国标=0）
+            if (Math.abs(measNum - gbNum) < 1e-9) return 'compliant'
+            // 用报告标准前缀推断方向
+            if (repFound) {
+                const rn = _normStr(reportStd)
+                if (/^[≥>]/.test(rn)) return measNum >= gbNum ? 'compliant' : 'inconsistent'  // ≥ → gbNum是最小值
+                if (/^[≤<]/.test(rn)) return measNum <= gbNum ? 'compliant' : 'inconsistent'  // ≤ → gbNum是最大值
+            }
+            // 无报告标准方向线索 → 无法判断
+        }
+    }
+
+    // ② 报告标准范围 ⊆ 国标范围
+    if (repFound) {
+        const repRange = _parseRange(reportStd)
+        if (repRange && gbRange) {
+            const minOk = gbRange.min === undefined || repRange.min === undefined || repRange.min >= gbRange.min
+            const maxOk = gbRange.max === undefined || repRange.max === undefined || repRange.max <= gbRange.max
+            return (minOk && maxOk) ? 'compliant' : 'inconsistent'
+        }
+        // ③ 字符串归一化比较（剥离 ≤/≥ 前缀）
+        const normV = s => _normStr(s).replace(/^[≤<≥>]/u, '')
+        return normV(reportStd) === normV(gbStd) ? 'compliant' : 'inconsistent'
+    }
+
+    return 'unknown'  // 无实测值、无报告标准，无法判断
+}
 
 /* ───────── 工具函数 ───────── */
 function statusText(s) {
     if (s === 'passed' || s === 'pass') return '通过'
     if (s === 'failed' || s === 'fail') return '未通过'
+    if (s === 'pending_review') return '待审核'
     return '待验证'
 }
 function statusClass(s) {
     if (s === 'passed' || s === 'pass') return 'passed'
     if (s === 'failed' || s === 'fail') return 'failed'
+    if (s === 'pending_review') return 'unknown'
     return 'unknown'
 }
 
-function calculateModulesStatus(s) {
+function calculateModulesStatus(s, overrides = {}) {
     if (!s) s = {}
 
     // ─── 标准指标合理性：从实际证据推算状态 ───
@@ -22,15 +173,28 @@ function calculateModulesStatus(s) {
     const NOT_FOUND = ['', '未找到限量值', '未提取', '未查到']
     const anyLimitFound = indicatorEvidence.some(e => e.extracted_limit && !NOT_FOUND.includes((e.extracted_limit || '').trim()))
     const anyLimitFailed = indicatorEvidence.some(e => e.limit_issue)
+
+    // 用与表格一致的逻辑：有任何一行 inconsistent → warning
+    const reportItems = s.items || []
+    const anyInconsistent = indicatorEvidence.some(ev => {
+        const ri = reportItems.find(r => (r.name || r.item_name || '') === ev.item)
+        const measureVal = ri ? (ri.value || ri.result || '–') : '–'
+        const repStd = ri ? (ri.standard || '–') : '–'
+        const gbStd = ev.standard_value || ''
+        return _checkCompliance(measureVal, repStd, gbStd) === 'inconsistent'
+    })
+
     let stdStatus
     if (indicatorEvidence.length === 0) {
         stdStatus = s.standard_indicators_status || 'unknown'
     } else if (anyLimitFailed) {
         stdStatus = 'failed'
+    } else if (anyInconsistent) {
+        stdStatus = 'warning'   // 报告标准与国标不符 → 警告
     } else if (anyLimitFound) {
         stdStatus = 'passed'
     } else {
-        stdStatus = 'unknown'  // 全部“未查到” → 待验证
+        stdStatus = 'unknown'  // 全部”未查到” → 待验证
     }
 
     // ─── 标签信息：从已上传的 labels 推算状态 ───
@@ -48,8 +212,29 @@ function calculateModulesStatus(s) {
     const basisStatus = s.regulatory_basis_consistent === true ? 'passed'
         : s.regulatory_basis_consistent === false ? 'failed' : 'unknown'
 
+    // ─── 检验项目合规性：动态根据 overrides 计算 ───
+    // 规则：
+    //   1. 有未解决的有条件项（需人工确认）→ 待审核（无论是否同时有缺失）
+    //   2. 无有条件项，但有报告缺失 → 未通过（缺失项不可人工覆盖）
+    //   3. 无缺失、无未解决有条件项 → 使用后端状态（通常为通过）
+    const ragComp = s.ragflow_verification || {}
+    const missingComp = ragComp.missing_items || []
+    const conditionalComp = ragComp.conditional_items || []
+    const unresolvedCondComp = conditionalComp.filter(item => overrides[item.name] !== 'allowed').length
+    let stdComplianceStatus
+    if (unresolvedCondComp > 0) {
+        // 有待人工确认的有条件项，无论是否同时存在缺失，先标为待审核
+        stdComplianceStatus = 'pending_review'
+    } else if (missingComp.length > 0) {
+        // 有条件项已全部解决（或本就没有），但存在真正缺失的项目 → 未通过
+        stdComplianceStatus = 'failed'
+    } else {
+        // 无缺失，有条件项全部已允许通过（或本就没有）→ 以后端状态为准
+        stdComplianceStatus = s.standards_compliance_status || 'unknown'
+    }
+
     const modules = [
-        { id: 'standards', title: '检验项目合规性', status: s.standards_compliance_status || 'unknown', desc: '检验项目是否符合实施细则规定' },
+        { id: 'standards', title: '检验项目合规性', status: stdComplianceStatus, desc: '检验项目是否符合实施细则规定' },
         { id: 'validation', title: '评价依据合理性', status: basisStatus, desc: '判定依据标准是否与细则一致' },
         { id: 'method_compliance', title: '检测方法合规性', status: s.method_compliance_status || 'unknown', desc: '检测方法是否合规有效' },
         { id: 'standard_compliance', title: '标准指标合理性', status: stdStatus, desc: '标准限量是否满足要求' },
@@ -70,9 +255,9 @@ function calculateModulesStatus(s) {
 }
 
 /* ───────── 综合核对结果 Tab ───────── */
-function SummaryTab({ result, onSwitchTab }) {
+function SummaryTab({ result, overrides = {}, onSwitchTab }) {
     const s = result.summary || {}
-    const { modules, failedCount, unknownCount } = calculateModulesStatus(s)
+    const { modules, failedCount, unknownCount } = calculateModulesStatus(s, overrides)
 
     const overallPassed = failedCount === 0 && unknownCount === 0
 
@@ -144,7 +329,7 @@ function ScreenshotModal({ src, onClose }) {
 }
 
 /* ───────── 评价依据合理性 Tab ───────── */
-function ValidationTab({ result }) {
+function ValidationTab({ result, onJumpToPdf }) {
     const s = result.summary || {}
     const gbResults = s.gb_validation || {}
     const rag = s.ragflow_verification || {}
@@ -333,8 +518,11 @@ function ValidationTab({ result }) {
                                         <tr key={code}>
                                             <td><strong>{code}</strong></td>
                                             <td>
-                                                <span className={`badge-sm ${v.passed ? 'success' : 'error'}`}>
-                                                    {v.status_text || (v.passed ? '现行有效' : '已废止')}
+                                                <span className={`badge-sm ${(v.status === 'valid' || (v.status_text && v.status_text.includes('现行') && v.status_text.includes('有效'))) ? 'success'
+                                                        : (v.status === 'error' || v.status === 'unknown') ? 'warning'
+                                                            : 'error'
+                                                    }`}>
+                                                    {v.status_text || (v.status === 'valid' ? '现行有效' : v.status === 'error' ? '验证失败' : v.status === 'unknown' ? '未知' : '已废止/无效')}
                                                 </span>
                                             </td>
                                             <td>
@@ -376,6 +564,20 @@ function ValidationTab({ result }) {
                                                     {dlError[code] && (
                                                         <span style={{ fontSize: 11, color: '#f87171', maxWidth: 160 }}>{dlError[code]}</span>
                                                     )}
+                                                    {/* 在右侧预览中查看 PDF */}
+                                                    <button
+                                                        className="btn-icon-sm"
+                                                        title={v.download_path ? '在预览中查看 PDF' : '未下载，无法预览'}
+                                                        disabled={!v.download_path || !onJumpToPdf}
+                                                        style={!v.download_path ? { opacity: 0.35, cursor: 'default' } : {}}
+                                                        onClick={() => onJumpToPdf && onJumpToPdf('gb', 1, code)}>
+                                                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                                            <polyline points="14 2 14 8 20 8" />
+                                                            <line x1="9" y1="13" x2="15" y2="13" />
+                                                            <line x1="9" y1="17" x2="15" y2="17" />
+                                                        </svg>
+                                                    </button>
                                                     {v.detail_url ? (
                                                         <a href={v.detail_url} target="_blank" rel="noreferrer" className="btn-icon-sm" title="查看详情页">
                                                             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -409,22 +611,78 @@ function ValidationTab({ result }) {
 
 
 /* ───────── 检验项目合规性 Tab ───────── */
-function StandardsTab({ result, onJumpToPdf }) {
+function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
     const s = result.summary || {}
     const rag = s.ragflow_verification || {}
     const matched = rag.matched_items || []
-    const missing = rag.missing_items || []   // 细则有，报告无 (string[])
-    const extra = rag.extra_items || []        // 报告有，细则无 (string[])
+    const missing = rag.missing_items || []          // 细则必检，报告无 (string[])
+    const conditional = rag.conditional_items || []  // 有条件检测 ({name, condition}[])
+    const extra = rag.extra_items || []              // 报告有，细则无 (string[])
 
-    const noData = matched.length === 0 && missing.length === 0 && extra.length === 0
-    if (noData) return <div className="info-scrim">未找到相关检验项目细则数据</div>
+    const toggleOverride = (name) => {
+        setOverrides(prev => {
+            if (prev[name] === 'allowed') {
+                const next = { ...prev }
+                delete next[name]
+                return next
+            }
+            return { ...prev, [name]: 'allowed' }
+        })
+    }
 
-    const totalRules = matched.length + missing.length
+    const noData = matched.length === 0 && missing.length === 0 && conditional.length === 0 && extra.length === 0
+    if (noData) {
+        const chatAnswer = rag.chat_answer
+        const chatRefs = rag.chat_references || []
+        if (chatAnswer) {
+            return (
+                <div className="section-block">
+                    <h3 className="block-title">检验项目合规性验证</h3>
+                    <div style={{ background: 'rgba(251,191,36,0.08)', border: '1px solid rgba(251,191,36,0.3)', borderRadius: 8, padding: '12px 16px', marginBottom: 12 }}>
+                        <div style={{ fontSize: 12, color: '#fbbf24', marginBottom: 6, fontWeight: 600 }}>⚠ 向量检索未提取到结构化检验项目，以下为大模型参考答案（需人工确认）</div>
+                        <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13, color: '#cbd5e1', margin: 0, lineHeight: 1.7 }}>{chatAnswer}</pre>
+                        {chatRefs.length > 0 && (
+                            <div style={{ marginTop: 8, fontSize: 11, color: '#94a3b8' }}>
+                                引用来源：{chatRefs.map((r, i) => <span key={i} style={{ marginRight: 8 }}>{r.file_name}{r.page ? ` p.${r.page}` : ''}</span>)}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )
+        }
+        return <div className="info-scrim">未找到相关检验项目细则数据</div>
+    }
 
-    // 只显示真正贡献了 matched_items 的细则页码（过滤掉未贡献条目的通用页面）
+    const totalRules = matched.length + missing.length + conditional.length
+
+    // 统计各类数量（缺失项不可人工覆盖，直接计实际数量）
+    const allowedConditionalCount = conditional.filter(item => overrides[item.name] === 'allowed').length
+    const unresolvedConditionalCount = conditional.filter(item => overrides[item.name] !== 'allowed').length
+    const effectiveMatchedCount = matched.length + allowedConditionalCount
+
     const evidencePages = [...new Set(
         matched.filter(m => m.source_page).map(m => m.source_page)
     )].sort((a, b) => a - b)
+
+    // 根据 match_type 返回对应徽章
+    const matchBadge = (item) => {
+        if (item.match_type === 'exact') return <span className="badge-sm success">✓ 精确匹配</span>
+        if (item.match_type === 'synonym') return <span className="badge-sm info" title="同义词匹配（如含量/总量）">≈ 同义词</span>
+        if (item.condition) return <span className="badge-sm warning" title={item.condition}>≈ 条件匹配</span>
+        return <span className="badge-sm success">≈ 模糊匹配</span>
+    }
+
+    const overrideBtnStyle = (active) => ({
+        marginLeft: 6,
+        padding: '1px 7px',
+        fontSize: 11,
+        borderRadius: 4,
+        border: active ? '1px solid #4ade80' : '1px solid #475569',
+        background: active ? 'rgba(74,222,128,0.15)' : 'transparent',
+        color: active ? '#4ade80' : '#94a3b8',
+        cursor: 'pointer',
+        lineHeight: 1.6,
+    })
 
     return (
         <div className="section-block">
@@ -445,24 +703,33 @@ function StandardsTab({ result, onJumpToPdf }) {
             )}
             <div style={{ marginBottom: 12, fontSize: 13, color: '#94a3b8' }}>
                 细则要求 <strong style={{ color: '#e2e8f0' }}>{totalRules}</strong> 项 ·
-                已匹配 <strong style={{ color: '#4ade80' }}>{matched.length}</strong> 项 ·
-                报告缺失 <strong style={{ color: '#f87171' }}>{missing.length}</strong> 项 ·
+                已匹配 <strong style={{ color: '#4ade80' }}>{effectiveMatchedCount}</strong> 项 ·
+                报告缺失 <strong style={{ color: missing.length > 0 ? '#f87171' : '#4ade80' }}>{missing.length}</strong> 项
+                {allowedConditionalCount > 0 && <> · 条件已确认 <strong style={{ color: '#4ade80' }}>{allowedConditionalCount}</strong> 项</>}
+                {unresolvedConditionalCount > 0 && <> · 待审核 <strong style={{ color: '#fbbf24' }}>{unresolvedConditionalCount}</strong> 项</>} ·
                 细则外 <strong style={{ color: '#fbbf24' }}>{extra.length}</strong> 项
             </div>
             <div className="table-container">
                 <table className="clean-table" style={{ width: '100%' }}>
                     <thead>
                         <tr>
+                            <th style={{ width: 52, whiteSpace: 'nowrap' }}>序号</th>
                             <th>细则要求项目</th>
                             <th>报告检验项目</th>
                             <th style={{ width: 80 }}>页码</th>
-                            <th style={{ width: 100 }}>一致性</th>
+                            <th style={{ width: 150 }}>匹配结果</th>
                         </tr>
                     </thead>
                     <tbody>
                         {matched.map((item, i) => (
                             <tr key={`m-${i}`}>
-                                <td>{item.name || '–'}</td>
+                                <td style={{ color: '#64748b', fontSize: 12, textAlign: 'center' }}>{i + 1}</td>
+                                <td>
+                                    {item.name || '–'}
+                                    {item.condition && (
+                                        <span title={item.condition} style={{ marginLeft: 4, fontSize: 11, color: '#fbbf24', cursor: 'help' }}>⚠</span>
+                                    )}
+                                </td>
                                 <td>{item.report_name || item.name || '–'}</td>
                                 <td>
                                     {item.source_page ? (
@@ -474,19 +741,47 @@ function StandardsTab({ result, onJumpToPdf }) {
                                         </button>
                                     ) : '–'}
                                 </td>
-                                <td><span className="badge-sm success">✓ 一致</span></td>
+                                <td>{matchBadge(item)}</td>
                             </tr>
                         ))}
                         {missing.map((name, i) => (
                             <tr key={`miss-${i}`}>
+                                <td style={{ color: '#64748b', fontSize: 12, textAlign: 'center' }}>{matched.length + i + 1}</td>
                                 <td>{name}</td>
                                 <td style={{ color: '#f87171' }}>—</td>
                                 <td>–</td>
-                                <td><span className="badge-sm error">报告缺失</span></td>
+                                <td><span className="badge-sm error">❌ 报告缺失</span></td>
                             </tr>
                         ))}
+                        {conditional.map((item, i) => {
+                            const isAllowed = overrides[item.name] === 'allowed'
+                            return (
+                                <tr key={`cond-${i}`} style={{ background: isAllowed ? 'rgba(74,222,128,0.05)' : 'rgba(251,191,36,0.05)' }}>
+                                    <td style={{ color: '#64748b', fontSize: 12, textAlign: 'center' }}>{matched.length + missing.length + i + 1}</td>
+                                    <td>
+                                        {item.name}
+                                        {!isAllowed && <span style={{ marginLeft: 4, fontSize: 11, color: '#fbbf24' }}>⚠</span>}
+                                    </td>
+                                    <td style={{ color: '#94a3b8', fontSize: 12 }}>{item.condition || '有条件才需检测'}</td>
+                                    <td>–</td>
+                                    <td>
+                                        {isAllowed
+                                            ? <span className="badge-sm success">✅ 条件满足</span>
+                                            : <span className="badge-sm warning">⚠ 有条件</span>
+                                        }
+                                        <button
+                                            style={overrideBtnStyle(isAllowed)}
+                                            title={isAllowed ? '撤销允许' : '确认条件满足，标记为已匹配'}
+                                            onClick={() => toggleOverride(item.name)}>
+                                            {isAllowed ? '撤销' : '允许通过'}
+                                        </button>
+                                    </td>
+                                </tr>
+                            )
+                        })}
                         {extra.map((name, i) => (
                             <tr key={`ex-${i}`}>
+                                <td style={{ color: '#64748b', fontSize: 12, textAlign: 'center' }}>{matched.length + missing.length + conditional.length + i + 1}</td>
                                 <td style={{ color: '#94a3b8' }}>—</td>
                                 <td>{name}</td>
                                 <td>–</td>
@@ -542,10 +837,16 @@ function MethodComplianceTab({ result, onJumpToPdf }) {
                     const methods = []
                     for (let k = 0; k < rawMethods.length; k++) {
                         const token = rawMethods[k]
-                        // 如果 token 是常见的标准前缀（纯字母或带斜杠字母，如 GB, GB/T, NY/T 等），且后面还有内容，则合并为一个完整的标准号
+                        // 合并标准前缀（如 GB、GB/T）与后续编号为一个完整标准号
                         if (/^[A-Za-z]+(?:\/[A-Za-z]+)?$/.test(token) && k + 1 < rawMethods.length) {
-                            methods.push(token + ' ' + rawMethods[k + 1])
-                            k++ // 跳过下一个 token
+                            let combined = token + ' ' + rawMethods[k + 1]
+                            k++
+                            // 若紧跟法序词（如"第一法"、"第二法、第三法"），合并进同一标准号
+                            if (k + 1 < rawMethods.length && /^第[一二三四五六七八九十百\d]/.test(rawMethods[k + 1])) {
+                                combined += ' ' + rawMethods[k + 1]
+                                k++
+                            }
+                            methods.push(combined)
                         } else {
                             methods.push(token)
                         }
@@ -598,6 +899,7 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
     const reportItems = result.items || []
     const indicatorEvidence = (rag.evidence || []).filter(e => e.type === 'indicator')
     const matchedItems = rag.matched_items || []
+    const gbValidation = (result.summary || {}).gb_validation || {}
 
     const reportValueMap = {}
     reportItems.forEach(item => {
@@ -605,8 +907,19 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
         if (key) reportValueMap[key] = item
     })
 
-    const LIMIT_NOT_FOUND = ['未找到限量值', '未提取', '未查到', '']
-    const isLimitFound = s => s && !LIMIT_NOT_FOUND.includes(s.trim())
+    const NOT_FOUND = ['未找到限量值', '未提取', '未查到', '–', '']
+    const isFound = s => s && !NOT_FOUND.includes(s.trim())
+
+    // 从 required_basis 匹配 gb_validation 中的 key，用于跳转正确 PDF
+    const findGbCode = (requiredBasis) => {
+        if (!requiredBasis) return null
+        const keys = Object.keys(gbValidation)
+        if (gbValidation[requiredBasis]) return requiredBasis
+        const numMatch = requiredBasis.match(/(\d+(?:\.\d+)?)/)
+        if (!numMatch) return null
+        const num = numMatch[1]
+        return keys.find(k => k.replace(/\s/g, '').includes(num)) || null
+    }
 
     const hasEvidence = indicatorEvidence.length > 0
 
@@ -616,17 +929,18 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
 
     return (
         <div>
-            {/* 表1：标准指标与计量单位核查 */}
+            {/* 表1：计量单位核查（只看单位是否一致） */}
             <div className="section-block">
-                <h3 className="block-title">标准指标与计量单位核查</h3>
+                <h3 className="block-title">计量单位核查</h3>
                 {hasEvidence ? (
                     <div className="table-container">
                         <table className="clean-table" style={{ width: '100%' }}>
                             <thead>
                                 <tr>
+                                    <th style={{ width: 52, whiteSpace: 'nowrap' }}>序号</th>
                                     <th>检验项目</th>
                                     <th>报告计量单位</th>
-                                    <th>国标限量原文（含单位）</th>
+                                    <th>国标标准单位</th>
                                     <th>来源国标及页码</th>
                                 </tr>
                             </thead>
@@ -634,13 +948,17 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                                 {indicatorEvidence.map((ev, i) => {
                                     const reportItem = reportValueMap[ev.item] || {}
                                     const reportUnit = reportItem.unit || '–'
-                                    const limitOk = isLimitFound(ev.extracted_limit)
+                                    const stdUnit = ev.standard_unit || '–'
+                                    const unitOk = isFound(stdUnit)
+                                    const unitMatch = unitOk && reportUnit !== '–' && reportUnit === stdUnit
+                                    const gbCode = findGbCode(ev.required_basis)
                                     return (
                                         <tr key={i}>
+                                            <td style={{ textAlign: 'center', color: '#94a3b8' }}>{i + 1}</td>
                                             <td>{ev.item}</td>
                                             <td>{reportUnit}</td>
-                                            <td style={{ fontSize: 12, color: limitOk ? 'inherit' : '#fbbf24' }}>
-                                                {limitOk ? ev.extracted_limit : '未查到'}
+                                            <td style={{ color: !unitOk ? '#fbbf24' : unitMatch ? '#22c55e' : 'inherit' }}>
+                                                {stdUnit}
                                             </td>
                                             <td>
                                                 <div style={{ fontSize: 11, color: '#94a3b8' }}>{ev.doc_name || '–'}</div>
@@ -648,7 +966,7 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                                                     <button className="badge-sm info"
                                                         style={{ cursor: 'pointer', marginTop: 4, display: 'block' }}
                                                         title={`跳转到国标第 ${ev.page_num} 页`}
-                                                        onClick={() => onJumpToPdf && onJumpToPdf('gb', ev.page_num)}>
+                                                        onClick={() => onJumpToPdf && onJumpToPdf('gb', ev.page_num, gbCode)}>
                                                         国标 P.{ev.page_num}
                                                     </button>
                                                 )}
@@ -672,9 +990,11 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                         <table className="clean-table" style={{ width: '100%' }}>
                             <thead>
                                 <tr>
+                                    <th style={{ width: 52, whiteSpace: 'nowrap' }}>序号</th>
                                     <th>检验项目</th>
                                     <th>报告实测值</th>
-                                    <th>国标限量值</th>
+                                    <th>报告标准指标</th>
+                                    <th>国标标准指标</th>
                                     <th style={{ width: 90 }}>结论</th>
                                 </tr>
                             </thead>
@@ -682,18 +1002,34 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                                 {indicatorEvidence.map((ev, i) => {
                                     const reportItem = reportValueMap[ev.item] || {}
                                     const measureVal = reportItem.value || reportItem.result || '–'
-                                    const limitOk = isLimitFound(ev.extracted_limit)
+                                    // 报告中扫描出的标准指标（"标准指标"列）
+                                    const reportStd = reportItem.standard || '–'
+                                    // 国标中提取的标准指标（纯数值/范围，无单位）
+                                    const gbStd = ev.standard_value || '未查到'
+                                    const gbStdFound = isFound(gbStd)
+                                    const reportStdFound = isFound(reportStd)
+
+                                    const compliance = _checkCompliance(measureVal, reportStd, gbStd)
                                     const isIssue = indicatorIssues.some(iss => iss.includes(ev.item))
                                     let badgeClass, badgeText
-                                    if (isIssue) { badgeClass = 'error'; badgeText = '超标' }
-                                    else if (!limitOk) { badgeClass = 'warning'; badgeText = '无法判断' }
-                                    else { badgeClass = 'success'; badgeText = '合规' }
+                                    if (compliance === 'inconsistent' || isIssue) {
+                                        badgeClass = isIssue ? 'error' : 'warning'
+                                        badgeText = '指标不符'
+                                    } else if (compliance === 'compliant') {
+                                        badgeClass = 'success'; badgeText = '合规'
+                                    } else {
+                                        badgeClass = 'warning'; badgeText = '无法判断'
+                                    }
                                     return (
                                         <tr key={i}>
+                                            <td style={{ textAlign: 'center', color: '#94a3b8' }}>{i + 1}</td>
                                             <td>{ev.item}</td>
                                             <td>{measureVal}</td>
-                                            <td style={{ fontSize: 12, color: limitOk ? 'inherit' : '#fbbf24' }}>
-                                                {limitOk ? ev.extracted_limit : '未查到限量值'}
+                                            <td style={{ color: compliance === 'inconsistent' ? '#f97316' : 'inherit' }}>
+                                                {reportStd}
+                                            </td>
+                                            <td style={{ fontSize: 12, color: !gbStdFound ? '#fbbf24' : 'inherit' }}>
+                                                {gbStdFound ? gbStd : '未查到'}
                                             </td>
                                             <td><span className={`badge-sm ${badgeClass}`}>{badgeText}</span></td>
                                         </tr>
@@ -859,10 +1195,20 @@ export default function ResultPage() {
     const [tab, setTab] = useState('summary')
     const [pdfView, setPdfView] = useState('report')  // report | rules | gb
     const [pdfPage, setPdfPage] = useState(1)          // 当前 PDF 页码
+    const [activeGbCode, setActiveGbCode] = useState(null)  // 当前选中的国标编号
     const appendInputRef = useRef(null)
     const hiddenFileInputRef = useRef(null)
     const [previewWidth, setPreviewWidth] = useState(42) // 默认 42vw 宽度
     const [sidebarWidth, setSidebarWidth] = useState(260) // 默认 260px 宽度
+    const [allOverrides, setAllOverrides] = useState({}) // 各报告的允许通过状态，key 为报告 index
+    const overrides = allOverrides[currentIndex] || {}
+    const setOverrides = (fn) => {
+        setAllOverrides(prev => {
+            const cur = prev[currentIndex] || {}
+            const next = typeof fn === 'function' ? fn(cur) : fn
+            return { ...prev, [currentIndex]: next }
+        })
+    }
 
     /* 拖拽调整侧边栏宽度 */
     const handleSidebarDragStart = (e) => {
@@ -908,10 +1254,11 @@ export default function ResultPage() {
         document.addEventListener('mouseup', onMouseUp)
     }
 
-    /* 跳转 PDF 页码 */
-    const jumpToPdf = (view, page) => {
+    /* 跳转 PDF 页码；view='gb' 时可传 gbCode 切换到指定国标 */
+    const jumpToPdf = (view, page, gbCode = null) => {
         setPdfView(view)
         setPdfPage(page || 1)
+        if (view === 'gb' && gbCode) setActiveGbCode(gbCode)
     }
 
     useEffect(() => {
@@ -920,18 +1267,24 @@ export default function ResultPage() {
         try { setResults(JSON.parse(raw)) } catch { navigate('/') }
     }, [navigate])
 
+    // 切换报告时，将 activeGbCode 重置为第一个有下载路径的国标（或首个国标）
+    useEffect(() => {
+        const res = results[currentIndex]
+        const summary = res?.summary || {}
+        const gbVal = summary.gb_validation || {}
+        const codes = summary.gb_codes || []
+        const first = codes.find(c => gbVal[c]?.download_path) || codes[0] || null
+        setActiveGbCode(first)
+    }, [currentIndex, results])
+
     const result = results[currentIndex]
     const s = result?.summary || {}
 
     /* PDF 视图 URL（含 #page=N 锚点跳页） */
     const gbDownloadPath = (() => {
-        const code = s.gb_codes?.[0]
-        if (!code) return ''
-        // 优先从 gb_validation 取已下载的路径
-        const v = (s.gb_validation || {})[code]
-        if (v?.download_path) return v.download_path
-        // 降级：static/files/{code}.pdf（空格保留，Flask 会 URL 编码）
-        return `/static/files/${code}.pdf`
+        if (!activeGbCode) return ''
+        const v = (s.gb_validation || {})[activeGbCode]
+        return v?.download_path || ''
     })()
     const pdfBaseUrl = pdfView === 'report'
         ? result?.pdf_url || ''
@@ -998,6 +1351,9 @@ export default function ResultPage() {
                     <div className="divider" />
                     <span className="page-title">核查结果</span>
                 </div>
+                <div className="header-right">
+                    <AdminMenu />
+                </div>
             </header>
 
             {/* ── 三栏主体 ── */}
@@ -1022,7 +1378,7 @@ export default function ResultPage() {
                                         <div className="file-meta">
                                             <span className="file-name" title={r.filename}>{r.filename}</span>
                                             {(() => {
-                                                const { failedCount, unknownCount } = calculateModulesStatus(r.summary)
+                                                const { failedCount, unknownCount } = calculateModulesStatus(r.summary, allOverrides[i] || {})
                                                 const risks = failedCount + unknownCount
                                                 return <span className="file-desc">{risks === 0 ? '无异常' : `${risks} 个风险项`}</span>
                                             })()}
@@ -1080,9 +1436,9 @@ export default function ResultPage() {
 
                     {/* Tab 内容区 */}
                     <div className="detail-scroll-area">
-                        {tab === 'summary' && <SummaryTab result={result} onSwitchTab={setTab} />}
-                        {tab === 'standards' && <StandardsTab result={result} onJumpToPdf={jumpToPdf} />}
-                        {tab === 'validation' && <ValidationTab result={result} />}
+                        {tab === 'summary' && <SummaryTab result={result} overrides={overrides} onSwitchTab={setTab} />}
+                        {tab === 'standards' && <StandardsTab result={result} overrides={overrides} setOverrides={setOverrides} onJumpToPdf={jumpToPdf} />}
+                        {tab === 'validation' && <ValidationTab result={result} onJumpToPdf={jumpToPdf} />}
                         {tab === 'method_compliance' && <MethodComplianceTab result={result} onJumpToPdf={jumpToPdf} />}
                         {tab === 'standard_compliance' && <StandardComplianceTab result={result} onJumpToPdf={jumpToPdf} />}
                         {tab === 'package' && <PackageTab result={result} />}
@@ -1099,25 +1455,64 @@ export default function ResultPage() {
                     <div className="preview-header">
                         <h3>原始报告预览</h3>
                         <div className="preview-controls">
-                            {['report', 'rules', 'gb'].map((v, _, arr) => {
+                            {['report', 'rules', 'gb'].map((v) => {
                                 const labels = { report: '报告', rules: '细则', gb: '国标' }
                                 return (
                                     <button key={v}
                                         className={`btn-icon-text ${pdfView === v ? 'active' : ''}`}
                                         onClick={() => jumpToPdf(v, 1)}>
                                         {labels[v]}
+                                        {v === 'gb' && (s.gb_codes?.length > 0) && (
+                                            <span className="gb-tab-count">{s.gb_codes.length}</span>
+                                        )}
                                     </button>
                                 )
                             })}
                         </div>
                     </div>
+
+                    {/* 国标子标签栏：切换到"国标"视图时显示 */}
+                    {pdfView === 'gb' && (s.gb_codes?.length > 0) && (
+                        <div className="gb-subtabs">
+                            {s.gb_codes.map(code => {
+                                const v = (s.gb_validation || {})[code]
+                                const hasPdf = !!v?.download_path
+                                const dotCls = v?.status === 'valid' ? 'dot-pass' : (v?.status === 'error' || v?.status === 'unknown' || !v?.status) ? 'dot-unknown' : 'dot-fail'
+                                return (
+                                    <button
+                                        key={code}
+                                        className={`gb-chip ${activeGbCode === code ? 'active' : ''} ${!hasPdf ? 'no-pdf' : ''}`}
+                                        title={hasPdf ? code : `${code}（未下载）`}
+                                        onClick={() => { setActiveGbCode(code); setPdfPage(1) }}>
+                                        <span className={`gb-dot ${dotCls}`} />
+                                        {code}
+                                        {!hasPdf && <span className="gb-chip-hint">未下载</span>}
+                                    </button>
+                                )
+                            })}
+                        </div>
+                    )}
+
                     <div className="preview-body">
-                        <iframe
-                            key={`${pdfView}-${pdfPage}`}
-                            src={pdfUrl}
-                            className="pdf-frame"
-                            title="PDF预览"
-                        />
+                        {pdfView === 'gb' && !gbDownloadPath ? (
+                            <div className="pdf-placeholder">
+                                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5">
+                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                    <polyline points="14 2 14 8 20 8" />
+                                </svg>
+                                <p>{activeGbCode ? `${activeGbCode} 尚未下载` : '未选择国标'}</p>
+                                <p className="pdf-placeholder-hint">
+                                    请在左侧"评价依据合理性"中点击下载按钮获取 PDF
+                                </p>
+                            </div>
+                        ) : (
+                            <iframe
+                                key={`${pdfView}-${activeGbCode}-${pdfPage}`}
+                                src={pdfUrl}
+                                className="pdf-frame"
+                                title="PDF预览"
+                            />
+                        )}
                     </div>
                 </section>
             </main>

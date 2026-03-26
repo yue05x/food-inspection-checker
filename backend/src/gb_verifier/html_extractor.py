@@ -2,65 +2,51 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import urllib.request
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
+STATUS_BY_GIF = {
+    "jjss.gif": "即将实施",
+    "xxyx.gif": "现行有效",
+    "bfyx.gif": "部分有效",
+    "jjfz.gif": "即将废止",
+    "yjfz.gif": "已经废止",
+}
+
 
 def fetch_detail_page_content(url: str, timeout: int = 30) -> str:
     """
-    获取详情页内容，使用 Playwright 以绕过反爬
-    
+    获取详情页内容，使用 urllib 直接请求以保留原始 HTML 结构。
+    使用 Playwright 渲染会标准化 HTML 属性（如 bgcolor="#FFFFFF" → "#ffffff"），
+    导致 extract_standard_info_from_html 的字符串匹配失败，无法提取日期字段。
+
     Args:
         url: 详情页 URL
         timeout: 超时时间（秒）
-        
+
     Returns:
         页面 HTML 内容（UTF-8 字符串）
-        
-    Raises:
-        Exception: 网络请求失败
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        raise ImportError("Playwright not installed. Please run: pip install playwright && python -m playwright install chromium")
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            # 使用固定 User-Agent 和 视口，模拟真实浏览器
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080}
-            )
-            page = context.new_page()
-            
-            # 设置 header
-            page.set_extra_http_headers({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Referer': 'https://down.foodmate.net/standard/'
-            })
-            
-            # 访问页面
+    Raises:
+        Exception: 网络请求失败或解码失败
+    """
+    req = urllib.request.Request(url)
+    req.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw_bytes = resp.read()
+
+        try:
+            return raw_bytes.decode('gb2312')
+        except UnicodeDecodeError:
             try:
-                page.goto(url, timeout=timeout * 1000, wait_until="commit")
-                # 等待一会儿让正文加载
-                page.wait_for_timeout(2000) 
-            except Exception as e:
-                if "Timeout" in str(e):
-                    print(f"Playwright navigation timeout for {url}, trying to extract available content anyway...")
-                else:
-                    raise
-            
-            content = page.content()
-            browser.close()
-            return content
-            
-    except Exception as e:
-        print(f"Error fetching {url} with Playwright: {e}")
-        raise
+                return raw_bytes.decode('gbk')
+            except UnicodeDecodeError:
+                return raw_bytes.decode('utf-8', errors='replace')
 
 
 def extract_text_between(html: str, start: str, end: str) -> Optional[str]:
@@ -92,21 +78,27 @@ def extract_text_between(html: str, start: str, end: str) -> Optional[str]:
     return content if content else None
 
 
+def _find_date_after_label(html: str, label: str) -> Optional[str]:
+    """
+    用正则从 HTML 中提取 <th>label</th><td>VALUE</td> 格式的日期，
+    兼容大小写差异、多余属性、内嵌标签等。
+    """
+    # 匹配 <th ...>label</th> 后紧跟 <td ...>内容</td>
+    pattern = rf'<th[^>]*>\s*{re.escape(label)}\s*</th>\s*<td[^>]*>(.*?)</td>'
+    m = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+    if m:
+        raw = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+        if raw and raw not in ('暂无', '', '/'):
+            return raw
+    return None
+
+
 def extract_standard_info_from_html(html: str, detail_url: str) -> dict:
     """
-    从HTML详情页中提取标准信息
-    
-    Args:
-        html: HTML 内容
-        detail_url: 详情页 URL
-        
+    从HTML详情页中提取标准信息（使用宽松 regex，兼容大小写/属性顺序变化）
+
     Returns:
-        包含标准信息的字典，包括以下字段：
-        - gb_number: GB编号（如 "GB 2763-2021"）
-        - publish_date: 发布日期
-        - implement_date: 实施日期
-        - abolish_date: 废止日期（可能为 None）
-        - status: 标准状态（"现行有效" 或 "已废止"）
+        包含 gb_number / publish_date / implement_date / abolish_date / status
     """
     info = {
         "gb_number": None,
@@ -115,63 +107,36 @@ def extract_standard_info_from_html(html: str, detail_url: str) -> dict:
         "abolish_date": None,
         "status": None,
     }
-    
-    # 提取GB编号（从标题中）
-    title_match = re.search(r'<span>(GB\s+[\d\.-]+)', html)
+
+    # GB 编号
+    title_match = re.search(r'<span>(GB\s+[\d\.\-/]+)', html)
     if title_match:
         info["gb_number"] = title_match.group(1)
-    
-    # 提取发布日期
-    publish_date = extract_text_between(html, '<th bgcolor="#FFFFFF">发布日期</th>', '</td>')
-    if publish_date:
-        # 提取最后一个>之后的内容
-        if '>' in publish_date:
-            publish_date = publish_date.split('>')[-1].strip()
-        info["publish_date"] = publish_date
-    
-    # 提取实施日期
-    implement_date = extract_text_between(html, '<th bgcolor="#FFFFFF">实施日期</th>', '</td>')
-    if implement_date:
-        # 提取最后一个>之后的内容
-        if '>' in implement_date:
-            implement_date = implement_date.split('>')[-1].strip()
-        info["implement_date"] = implement_date
-    
-    # 提取废止日期
-    abolish_date = extract_text_between(html, '<th bgcolor="#FFFFFF">废止日期</th>', '</td>')
-    if abolish_date:
-        # 提取最后一个>之后的内容
-        if '>' in abolish_date:
-            abolish_date = abolish_date.split('>')[-1].strip()
-        # 如果是"暂无"，则设置为 None
-        if abolish_date == "暂无":
-            info["abolish_date"] = None
-        else:
-            info["abolish_date"] = abolish_date
-    
-    # 提取标准状态（通过图片判断）
-    status_section = extract_text_between(html, '<th bgcolor="#FFFFFF">标准状态</th>', '<th bgcolor="#FFFFFF">实施日期</th>')
-    if status_section is not None:
-        # 在原始HTML中查找状态部分
-        status_start = html.find('<th bgcolor="#FFFFFF">标准状态</th>')
-        if status_start != -1:
-            status_end = html.find('<th bgcolor="#FFFFFF">实施日期</th>', status_start)
-            if status_end != -1:
-                status_html = html[status_start:status_end]
-                if 'yjfz.gif' in status_html:
-                    info["status"] = "已废止"
-                elif 'xxyx.gif' in status_html:
-                    info["status"] = "现行有效"
-                else:
-                    # 尝试从文本中提取状态（针对没有 gif 图片的情况）
-                    clean_status = re.sub(r'<[^>]+>', '', status_html).strip()
-                    if "现行" in clean_status or "有效" in clean_status:
-                        info["status"] = "现行有效"
-                    elif "废止" in clean_status or "作废" in clean_status:
-                        info["status"] = "已废止"
-                    elif "即将实施" in clean_status:
-                        info["status"] = "即将实施"
-    
+
+    # 日期字段
+    info["publish_date"]   = _find_date_after_label(html, "发布日期")
+    info["implement_date"] = _find_date_after_label(html, "实施日期")
+    raw_abolish            = _find_date_after_label(html, "废止日期")
+    info["abolish_date"]   = raw_abolish if raw_abolish and raw_abolish != "暂无" else None
+
+    # 标准状态：优先 GIF 图片名，降级文本关键词
+    for gif, status in STATUS_BY_GIF.items():
+        if gif in html:
+            info["status"] = status
+            break
+    if not info["status"]:
+        # 在 <th>标准状态</th> 附近检索
+        m_st = re.search(r'<th[^>]*>\s*标准状态\s*</th>(.*?)</td>', html, re.IGNORECASE | re.DOTALL)
+        block = m_st.group(1) if m_st else html
+        if "现行有效" in block:
+            info["status"] = "现行有效"
+        elif "已废止" in block or "yjfz" in block or "作废" in block:
+            info["status"] = "已废止"
+        elif "即将实施" in block:
+            info["status"] = "即将实施"
+
+    logger.info("HTML提取结果: publish=%s implement=%s abolish=%s status=%s",
+                info["publish_date"], info["implement_date"], info["abolish_date"], info["status"])
     return info
 
 
@@ -188,7 +153,7 @@ def search_gb_detail_url(gb_number: str) -> Optional[str]:
 
     
     search_url = f"https://down.foodmate.net/standard/search.php?kw={gb_number}"
-    print(f"Searching locally (Playwright): {search_url}")
+    logger.info("本地搜索: %s", search_url)
     
     try:
         from playwright.sync_api import sync_playwright
@@ -214,5 +179,5 @@ def search_gb_detail_url(gb_number: str) -> Optional[str]:
         return None
         
     except Exception as e:
-        print(f"Local search failed for {gb_number}: {e}")
+        logger.warning("本地搜索失败 %s: %s", gb_number, e)
         return None
