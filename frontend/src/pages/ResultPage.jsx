@@ -43,13 +43,18 @@ const _parseMeasNum = rawStr => {
 }
 
 // ── 食品微生物 n/c/m/M 采样计划工具 ──────────────────────────────────────────
-// 解析 "n=5,c=2,m=1000,M=10000" → {n,c,m,M} 或 null
+// 解析 "n=5,c=2,m=1000,M=10000" 或 "n=5,c=0,m=0"（致病菌无 M）→ {n,c,m,M?} 或 null
 const _parseNcmM = s => {
     if (!s) return null
     const nm = s.match(/\bn\s*=\s*(\d+)/), cm = s.match(/\bc\s*=\s*(\d+)/)
     const mm = s.match(/(?<![nNcC])\bm\s*=\s*([\d.]+)/), MM = s.match(/\bM\s*=\s*([\d.]+)/)
-    if (!nm || !cm || !mm || !MM) return null
-    return { n: parseInt(nm[1]), c: parseInt(cm[1]), m: parseFloat(mm[1]), M: parseFloat(MM[1]) }
+    if (!nm || !cm || !mm) return null   // M 是可选的（致病菌无 M）
+    return {
+        n: parseInt(nm[1]),
+        c: parseInt(cm[1]),
+        m: parseFloat(mm[1]),
+        M: MM ? parseFloat(MM[1]) : undefined,  // undefined = 致病菌（不得检出）
+    }
 }
 
 // 解析逗号分隔的多样品实测值 → [float, ...] 或 null（单值返回 null）
@@ -66,15 +71,26 @@ const _parseMicrobialSamples = s => {
     return vals.every(v => v !== null) ? vals : null
 }
 
-// n/c/m/M 判定 → 'compliant' | 'inconsistent' | 'unknown'
+// n/c/m/M 判定（对应 Python evaluate_microbiology 逻辑）
+// → 'compliant' | 'inconsistent' | 'unknown'
 const _judgeNcmM = (samples, plan) => {
-    const { c, m, M } = plan
-    let between = 0
-    for (const v of samples) {
-        if (v > M) return 'inconsistent'
-        if (v > m) between++
+    const { n, c, m, M } = plan
+
+    // 样本数量校验
+    if (samples.length !== n) return 'unknown'
+
+    // 致病菌（M 未定义，如沙门氏菌 n=5,c=0,m=0）：任何检出即不合格
+    if (M === undefined) {
+        return samples.some(v => v > m) ? 'inconsistent' : 'compliant'
     }
-    return between > c ? 'inconsistent' : 'compliant'
+
+    // 普通微生物：统计超过 m 但未超过 M 的样本数
+    let exceedM = 0
+    for (const v of samples) {
+        if (v > M) return 'inconsistent'   // 超过最大限值 → 直接不合格
+        if (v > m) exceedM++
+    }
+    return exceedM > c ? 'inconsistent' : 'compliant'
 }
 
 // 综合判断一行的合规性
@@ -95,10 +111,11 @@ function _checkCompliance(measureVal, reportStd, gbStd) {
     if (plan && measFound) {
         const samples = _parseMicrobialSamples(measureVal)
         if (samples) return _judgeNcmM(samples, plan)
-        // 单值时：要求 ≤ m
+        // 单值时：致病菌（M=undefined）直接比较 m；普通微生物比较 M
         const sv = _normStr(measureVal).replace(/[<＜]/g, '')
         const num = parseFloat(sv)
         if (!isNaN(num)) {
+            if (plan.M === undefined) return num > plan.m ? 'inconsistent' : 'compliant'
             if (num > plan.M) return 'inconsistent'
             if (num > plan.m) return 'unknown'   // 介于 m~M，需全套采样数据
             return 'compliant'
@@ -150,6 +167,59 @@ function _checkCompliance(measureVal, reportStd, gbStd) {
     return 'unknown'  // 无实测值、无报告标准，无法判断
 }
 
+// 实测值范围核查行分类
+// 返回: 'compliant'|'exceeded'|'standard_mismatch'|'missing_standard'|'missing_unit'
+function _classifyRow(measureVal, reportStd, gbStd, stdUnit) {
+    const NOT_FOUND = new Set(['未找到限量值', '未提取', '未查到', '–', ''])
+    const gbFound   = gbStd    && !NOT_FOUND.has(gbStd.trim())
+    const unitFound = stdUnit  && stdUnit !== '–' && stdUnit.trim() !== ''
+
+    if (!unitFound) return 'missing_unit'
+    if (!gbFound)   return 'missing_standard'
+
+    const gbRange = _parseRange(gbStd)
+    const measNum = _parseMeasNum(measureVal)
+
+    // ① 优先：直接数值比较（最可靠）—— 实测值 vs 国标范围
+    if (gbRange && measNum !== null) {
+        const minOk = gbRange.min === undefined || measNum >= gbRange.min
+        const maxOk = gbRange.max === undefined || measNum <= gbRange.max
+        return (minOk && maxOk) ? 'compliant' : 'exceeded'
+    }
+
+    // ② 使用综合判断（含微生物计划、报告标准方向推断、字符串比较等）
+    const compliance = _checkCompliance(measureVal, reportStd, gbStd)
+
+    if (compliance === 'compliant') {
+        // 最终安全校验：若实测值和国标数字可解析，确认实测值未超标
+        if (measNum !== null) {
+            const gbNum = parseFloat(_normStr(gbStd).replace(/[^0-9.]/g, ''))
+            if (!isNaN(gbNum)) {
+                const rn = _normStr(reportStd || gbStd)
+                if (/^[≤<]/.test(rn) && measNum > gbNum) return 'exceeded'
+                if (/^[≥>]/.test(rn) && measNum < gbNum) return 'exceeded'
+            }
+        }
+        return 'compliant'
+    }
+
+    if (compliance === 'inconsistent') {
+        // 区分「指标超标」（实测值超出限量）vs「指标不符」（标准范围引用错误）
+        if (measNum !== null) {
+            const gbNum = parseFloat(_normStr(gbStd).replace(/[^0-9.]/g, ''))
+            if (!isNaN(gbNum)) {
+                const rn = _normStr(reportStd || gbStd)
+                if (/^[≤<]/.test(rn) && measNum > gbNum) return 'exceeded'
+                if (/^[≥>]/.test(rn) && measNum < gbNum) return 'exceeded'
+            }
+        }
+        return 'standard_mismatch'
+    }
+
+    // compliance === 'unknown'：国标已找到，但无法数值判断 → 黄色待审核
+    return 'missing_standard'
+}
+
 /* ───────── 工具函数 ───────── */
 function statusText(s) {
     if (s === 'passed' || s === 'pass') return '通过'
@@ -164,37 +234,51 @@ function statusClass(s) {
     return 'unknown'
 }
 
-function calculateModulesStatus(s, overrides = {}) {
+function calculateModulesStatus(s, overrides = {}, items = []) {
     if (!s) s = {}
 
-    // ─── 标准指标合理性：从实际证据推算状态 ───
+    // ─── 标准指标合理性：按新规则计算 ───
     const rag = s.ragflow_verification || {}
     const indicatorEvidence = (rag.evidence || []).filter(e => e.type === 'indicator')
-    const NOT_FOUND = ['', '未找到限量值', '未提取', '未查到']
-    const anyLimitFound = indicatorEvidence.some(e => e.extracted_limit && !NOT_FOUND.includes((e.extracted_limit || '').trim()))
-    const anyLimitFailed = indicatorEvidence.some(e => e.limit_issue)
 
-    // 用与表格一致的逻辑：有任何一行 inconsistent → warning
-    const reportItems = s.items || []
-    const anyInconsistent = indicatorEvidence.some(ev => {
-        const ri = reportItems.find(r => (r.name || r.item_name || '') === ev.item)
-        const measureVal = ri ? (ri.value || ri.result || '–') : '–'
-        const repStd = ri ? (ri.standard || '–') : '–'
-        const gbStd = ev.standard_value || ''
-        return _checkCompliance(measureVal, repStd, gbStd) === 'inconsistent'
+    const reportValueMap = {}
+    items.forEach(item => {
+        const key = (item.item || item.name || item.item_name || '').trim()
+        if (key) reportValueMap[key] = item
+    })
+
+    const isYellow = cls => cls === 'missing_standard' || cls === 'missing_unit'
+    const isRed    = cls => cls === 'exceeded' || cls === 'standard_mismatch'
+
+    let anyUnresolvedYellow = false
+    let anyRed = false
+    indicatorEvidence.forEach(ev => {
+        const ri = reportValueMap[ev.item] || {}
+        const measureVal = ri.value || ri.result || '–'
+        const repStd     = ri.standard || '–'
+        const gbStd      = ev.standard_value || ''
+        const stdUnit    = ev.standard_unit  || ''
+        const choice     = overrides[`__ev_choice__${ev.item}`]
+        const autoClass  = _classifyRow(measureVal, repStd, gbStd, stdUnit)
+
+        if (choice) {
+            if (choice !== 'compliant') anyRed = true
+        } else if (isYellow(autoClass)) {
+            anyUnresolvedYellow = true
+        } else if (isRed(autoClass)) {
+            anyRed = true
+        }
     })
 
     let stdStatus
     if (indicatorEvidence.length === 0) {
         stdStatus = s.standard_indicators_status || 'unknown'
-    } else if (anyLimitFailed) {
-        stdStatus = 'failed'
-    } else if (anyInconsistent) {
-        stdStatus = 'warning'   // 报告标准与国标不符 → 警告
-    } else if (anyLimitFound) {
-        stdStatus = 'passed'
+    } else if (anyRed) {
+        stdStatus = 'failed'             // 红色（已确认不合规）优先于待审核
+    } else if (anyUnresolvedYellow) {
+        stdStatus = 'pending_review'
     } else {
-        stdStatus = 'unknown'  // 全部”未查到” → 待验证
+        stdStatus = 'passed'
     }
 
     // ─── 标签信息：从已上传的 labels 推算状态 ───
@@ -223,15 +307,15 @@ function calculateModulesStatus(s, overrides = {}) {
     const unresolvedCondComp = conditionalComp.filter(item => !overrides[item.name]).length
     const rejectedCondComp   = conditionalComp.filter(item => overrides[item.name] === 'rejected').length
     let stdComplianceStatus
-    if (unresolvedCondComp > 0) {
-        // 有待人工确认的有条件项，无论是否同时存在缺失，先标为待审核
-        stdComplianceStatus = 'pending_review'
-    } else if (missingComp.length > 0 || rejectedCondComp > 0) {
-        // 有条件项已全部解决（或本就没有），但存在真正缺失或被拒绝的项目 → 未通过
+    if (missingComp.length > 0 || rejectedCondComp > 0) {
+        // 缺失项或已拒绝的有条件项 → 红色，直接未通过（优先于待审核）
         stdComplianceStatus = 'failed'
+    } else if (unresolvedCondComp > 0) {
+        // 有待人工确认的有条件项 → 待审核
+        stdComplianceStatus = 'pending_review'
     } else {
-        // 无缺失，有条件项全部已允许通过（或本就没有）→ 以后端状态为准
-        stdComplianceStatus = s.standards_compliance_status || 'unknown'
+        // 无缺失，有条件项全部已解决（通过/不适用）→ 通过
+        stdComplianceStatus = 'passed'
     }
 
     const modules = [
@@ -245,27 +329,37 @@ function calculateModulesStatus(s, overrides = {}) {
     let failedCount = 0
     let unknownCount = 0
     let passedCount = 0
+    let pendingReviewCount = 0
     modules.forEach(m => {
         const sc = statusClass(m.status)
         if (sc === 'failed') failedCount++
         else if (sc === 'passed') passedCount++
-        else unknownCount++
+        else {
+            unknownCount++
+            if (m.status === 'pending_review') pendingReviewCount++
+        }
     })
 
-    return { modules, failedCount, unknownCount, passedCount }
+    return { modules, failedCount, unknownCount, passedCount, pendingReviewCount }
 }
 
 /* ───────── 综合核对结果 Tab ───────── */
 function SummaryTab({ result, overrides = {}, onSwitchTab }) {
     const s = result.summary || {}
-    const { modules, failedCount, unknownCount } = calculateModulesStatus(s, overrides)
+    const items = result.items || []
+    const { modules, failedCount, unknownCount, pendingReviewCount } = calculateModulesStatus(s, overrides, items)
 
     const overallPassed = failedCount === 0 && unknownCount === 0
+    const hasPendingReview = pendingReviewCount > 0
+
+    // 有红色（未通过）优先显示未通过；无红色但有待审核时显示待审核
+    const overallTitle = failedCount > 0 ? '验证未通过' : hasPendingReview ? '待审核' : overallPassed ? '验证通过' : '待补充信息'
+    const overallClass = failedCount > 0 ? 'failed' : hasPendingReview ? 'unknown' : overallPassed ? 'passed' : 'unknown'
 
     return (
         <div>
             {/* 总体状态 */}
-            <div className={`overall-status ${failedCount > 0 ? 'failed' : overallPassed ? 'passed' : 'unknown'}`}>
+            <div className={`overall-status ${overallClass}`}>
                 <div className="status-icon">
                     {failedCount > 0
                         ? <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" /></svg>
@@ -275,11 +369,16 @@ function SummaryTab({ result, overrides = {}, onSwitchTab }) {
                     }
                 </div>
                 <div className="status-content">
-                    <h2 className="status-title">{failedCount > 0 ? '验证未通过' : overallPassed ? '验证通过' : '待补充信息'}</h2>
+                    <h2 className="status-title">{overallTitle}</h2>
                     <p className="status-description">
-                        {failedCount > 0 || unknownCount > 0
-                            ? `检测到 ${failedCount} 个模块未通过，${unknownCount} 个模块待验证`
-                            : '所有验证项目均符合要求'}
+                        {failedCount > 0 && !hasPendingReview
+                            ? `检测到 ${failedCount} 个模块未通过`
+                            : failedCount > 0 && hasPendingReview
+                                ? `${failedCount} 个模块未通过，另有 ${pendingReviewCount} 个模块需人工确认`
+                                : hasPendingReview
+                                    ? `${pendingReviewCount} 个模块存在无法自动判断的项目，需人工确认`
+                                    : overallPassed ? '所有验证项目均符合要求'
+                                        : `${unknownCount} 个模块待补充信息`}
                     </p>
                 </div>
             </div>
@@ -620,16 +719,7 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
     const conditional = rag.conditional_items || []  // 有条件检测 ({name, condition}[])
     const extra = rag.extra_items || []              // 报告有，细则无 (string[])
 
-    const toggleOverride = (name) => {
-        setOverrides(prev => {
-            if (prev[name] === 'allowed') {
-                const next = { ...prev }
-                delete next[name]
-                return next
-            }
-            return { ...prev, [name]: 'allowed' }
-        })
-    }
+    const [pendingAllowTarget, setPendingAllowTarget] = useState(null) // 待确认"允许通过"的项目名
 
     const noData = matched.length === 0 && missing.length === 0 && conditional.length === 0 && extra.length === 0
     if (noData) {
@@ -657,10 +747,14 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
     const totalRules = matched.length + missing.length + conditional.length
 
     // 统计各类数量
-    const allowedConditionalCount   = conditional.filter(item => overrides[item.name] === 'allowed').length
-    const rejectedConditionalCount  = conditional.filter(item => overrides[item.name] === 'rejected').length
+    // condition_met: 满足条件已检测（计入匹配）; condition_not_applicable: 不满足条件无需检测; 'allowed': 旧值兼容
+    const _isAllowed = v => v === 'allowed' || v === 'condition_met' || v === 'condition_not_applicable'
+    const conditionMetCount         = conditional.filter(item => item.name && (overrides[item.name] === 'condition_met' || overrides[item.name] === 'allowed')).length
+    const conditionNACount          = conditional.filter(item => item.name && overrides[item.name] === 'condition_not_applicable').length
+    const allowedConditionalCount   = conditionMetCount + conditionNACount
+    const rejectedConditionalCount  = conditional.filter(item => item.name && overrides[item.name] === 'rejected').length
     const unresolvedConditionalCount = conditional.filter(item => !overrides[item.name]).length
-    const effectiveMatchedCount = matched.length + allowedConditionalCount
+    const effectiveMatchedCount = matched.length + conditionMetCount  // 只有已检测项计入匹配
 
     const evidencePages = [...new Set(
         matched.filter(m => m.source_page).map(m => m.source_page)
@@ -670,7 +764,7 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
     const matchBadge = (item) => {
         if (item.match_type === 'exact') return <span className="badge-sm success">✓ 精确匹配</span>
         if (item.match_type === 'synonym') return <span className="badge-sm info" title="同义词匹配（如含量/总量）">≈ 同义词</span>
-        if (item.condition) return <span className="badge-sm warning" title={item.condition}>≈ 条件匹配</span>
+        if (item.condition) return <span className="badge-sm success" title={item.condition}>≈ 条件匹配</span>
         return <span className="badge-sm success">≈ 模糊匹配</span>
     }
 
@@ -707,7 +801,8 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
                 细则要求 <strong style={{ color: '#e2e8f0' }}>{totalRules}</strong> 项 ·
                 已匹配 <strong style={{ color: '#4ade80' }}>{effectiveMatchedCount}</strong> 项 ·
                 报告缺失 <strong style={{ color: (missing.length + rejectedConditionalCount) > 0 ? '#f87171' : '#4ade80' }}>{missing.length + rejectedConditionalCount}</strong> 项
-                {allowedConditionalCount > 0 && <> · 条件已确认 <strong style={{ color: '#4ade80' }}>{allowedConditionalCount}</strong> 项</>}
+                {conditionMetCount > 0 && <> · 条件匹配 <strong style={{ color: '#4ade80' }}>{conditionMetCount}</strong> 项</>}
+                {conditionNACount > 0 && <> · 条件不适用 <strong style={{ color: '#60a5fa' }}>{conditionNACount}</strong> 项</>}
                 {unresolvedConditionalCount > 0 && <> · 待审核 <strong style={{ color: '#fbbf24' }}>{unresolvedConditionalCount}</strong> 项</>} ·
                 细则外 <strong style={{ color: '#fbbf24' }}>{extra.length}</strong> 项
             </div>
@@ -756,14 +851,14 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
                             </tr>
                         ))}
                         {conditional.map((item, i) => {
-                            const decision   = overrides[item.name]  // 'allowed' | 'rejected' | undefined
-                            const isAllowed  = decision === 'allowed'
+                            const decision   = overrides[item.name]
                             const isRejected = decision === 'rejected'
-                            const rowBg = isAllowed  ? 'rgba(74,222,128,0.05)'
+                            const isResolved = _isAllowed(decision)
+                            const rowBg = isResolved ? (decision === 'condition_not_applicable' ? 'rgba(96,165,250,0.05)' : 'rgba(74,222,128,0.05)')
                                         : isRejected ? 'rgba(239,68,68,0.05)'
                                         : 'rgba(251,191,36,0.05)'
-                            const setDecision = (val) => setOverrides(prev => ({ ...prev, [item.name]: val }))
                             const clearDecision = () => setOverrides(prev => { const n = { ...prev }; delete n[item.name]; return n })
+                            const setDecision   = (val) => setOverrides(prev => ({ ...prev, [item.name]: val }))
                             return (
                                 <tr key={`cond-${i}`} style={{ background: rowBg }}>
                                     <td style={{ color: '#64748b', fontSize: 12, textAlign: 'center' }}>{matched.length + missing.length + i + 1}</td>
@@ -774,15 +869,20 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
                                     <td style={{ color: '#94a3b8', fontSize: 12 }}>{item.condition || '有条件才需检测'}</td>
                                     <td>–</td>
                                     <td>
-                                        {isAllowed  && <span className="badge-sm success" style={{ marginRight: 6 }}>条件匹配</span>}
-                                        {isRejected && <span className="badge-sm error"   style={{ marginRight: 6 }}>❌ 报告缺失</span>}
-                                        {!decision  && <span className="badge-sm warning" style={{ marginRight: 6 }}>⚠ 有条件</span>}
+                                        {(decision === 'condition_met' || decision === 'allowed') &&
+                                            <span className="badge-sm success" style={{ marginRight: 6 }}>✓ 条件匹配</span>}
+                                        {decision === 'condition_not_applicable' &&
+                                            <span className="badge-sm info" style={{ marginRight: 6 }}>条件不适用</span>}
+                                        {isRejected &&
+                                            <span className="badge-sm error" style={{ marginRight: 6 }}>❌ 报告缺失</span>}
+                                        {!decision &&
+                                            <span className="badge-sm warning" style={{ marginRight: 6 }}>⚠ 有条件</span>}
                                         {decision
-                                            ? <button style={overrideBtnStyle(false)} onClick={clearDecision}>撤销</button>
-                                            : <>
-                                                <button style={overrideBtnStyle(false)} onClick={() => setDecision('allowed')}>允许通过</button>
-                                                <button style={{ ...overrideBtnStyle(false), marginLeft: 4, borderColor: '#f87171', color: '#f87171' }} onClick={() => setDecision('rejected')}>不允许通过</button>
-                                              </>
+                                            ? <button style={{ fontSize: 10, color: '#94a3b8', background: 'none', border: 'none', cursor: 'pointer', padding: 0, marginLeft: 6 }} onClick={clearDecision}>撤销</button>
+                                            : <div style={{ display: 'flex', gap: 4, marginTop: 2 }}>
+                                                <button className="badge-sm success" style={{ cursor: 'pointer', border: 'none', fontSize: 11 }} onClick={() => setPendingAllowTarget(item.name)}>允许通过</button>
+                                                <button className="badge-sm error" style={{ cursor: 'pointer', border: 'none', fontSize: 11 }} onClick={() => setDecision('rejected')}>不允许通过</button>
+                                              </div>
                                         }
                                     </td>
                                 </tr>
@@ -800,19 +900,94 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
                     </tbody>
                 </table>
             </div>
+
+            {/* 允许通过原因选择弹窗 */}
+            {pendingAllowTarget && (
+                <div onClick={() => setPendingAllowTarget(null)} style={{
+                    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999
+                }}>
+                    <div onClick={e => e.stopPropagation()} style={{
+                        background: '#fff', borderRadius: 12, padding: '28px 32px', minWidth: 340,
+                        boxShadow: '0 20px 60px rgba(0,0,0,0.25)'
+                    }}>
+                        <h4 style={{ margin: '0 0 8px', fontSize: 16, color: '#1e293b' }}>确认允许通过原因</h4>
+                        <p style={{ margin: '0 0 20px', fontSize: 13, color: '#64748b' }}>
+                            项目：<strong>{pendingAllowTarget}</strong>
+                        </p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                            {[
+                                {
+                                    key: 'condition_met',
+                                    label: '满足条件，已在报告中检测',
+                                    desc: '该条件成立，检验报告已包含此项目，计入匹配项',
+                                    color: '#16a34a',
+                                    border: '#86efac',
+                                    bg: 'rgba(74,222,128,0.06)',
+                                },
+                                {
+                                    key: 'condition_not_applicable',
+                                    label: '不满足条件，无需检测',
+                                    desc: '该条件不成立，此项目无需检测，不计入缺失',
+                                    color: '#2563eb',
+                                    border: '#93c5fd',
+                                    bg: 'rgba(96,165,250,0.06)',
+                                },
+                            ].map(opt => (
+                                <button key={opt.key} onClick={() => {
+                                    setOverrides(prev => ({ ...prev, [pendingAllowTarget]: opt.key }))
+                                    setPendingAllowTarget(null)
+                                }} style={{
+                                    display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
+                                    padding: '12px 16px', borderRadius: 8, border: `1.5px solid ${opt.border}`,
+                                    background: opt.bg, cursor: 'pointer', textAlign: 'left',
+                                    transition: 'border-color 0.15s',
+                                }}
+                                    onMouseEnter={e => e.currentTarget.style.borderColor = opt.color}
+                                    onMouseLeave={e => e.currentTarget.style.borderColor = opt.border}
+                                >
+                                    <span style={{ fontWeight: 600, color: opt.color, fontSize: 14 }}>{opt.label}</span>
+                                    <span style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>{opt.desc}</span>
+                                </button>
+                            ))}
+                        </div>
+                        <button onClick={() => setPendingAllowTarget(null)} style={{
+                            marginTop: 16, width: '100%', padding: '8px', borderRadius: 6,
+                            border: '1px solid #e2e8f0', background: 'none', cursor: 'pointer',
+                            fontSize: 13, color: '#64748b'
+                        }}>取消</button>
+                    </div>
+                </div>
+            )}
         </div>
     )
 }
 
 
 /* ───────── 检测方法合规性 Tab ───────── */
-function MethodComplianceTab({ result, onJumpToPdf }) {
+function MethodComplianceTab({ result, onJumpToPdf, overrides = {} }) {
     const rag = (result.summary || {}).ragflow_verification || {}
     const matched = rag.matched_items || []
     const methodIssues = rag.method_issues || []
     const issueNames = new Set(methodIssues.map(i => i.item))
+    const conditional = rag.conditional_items || []
+    const reportItems = result.items || []
 
-    if (matched.length === 0) {
+    const reportValueMap = {}
+    reportItems.forEach(item => {
+        const key = (item.item || '').trim()
+        if (key) reportValueMap[key] = item
+    })
+
+    // condition_met 项需要加入方法核查（如果 matched 中还没有）
+    const matchedNames = new Set(matched.map(m => m.name))
+    const conditionMetExtras = conditional.filter(item =>
+        item.name &&
+        overrides[item.name] === 'condition_met' &&
+        !matchedNames.has(item.name)
+    )
+
+    if (matched.length === 0 && conditionMetExtras.length === 0) {
         return <div className="info-scrim">无方法核查数据</div>
     }
 
@@ -868,7 +1043,7 @@ function MethodComplianceTab({ result, onJumpToPdf }) {
                             background: 'var(--color-surface)',
                         }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                                <strong style={{ fontSize: 14 }}>{item.name}</strong>
+                                <strong style={{ fontSize: 14 }}><span style={{ color: '#94a3b8', fontWeight: 400, marginRight: 6 }}>{i + 1}.</span>{item.name}</strong>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                                     {item.source_page && (
                                         <button className="badge-sm info"
@@ -896,25 +1071,69 @@ function MethodComplianceTab({ result, onJumpToPdf }) {
                         </div>
                     )
                 })}
+                {conditionMetExtras.map((item, i) => {
+                    const reportItem = reportValueMap[item.name] || {}
+                    const reportMethod = reportItem.method || '未识别'
+                    return (
+                        <div key={`cond-${i}`} style={{
+                            borderRadius: 8,
+                            border: '1px solid rgba(96,165,250,0.3)',
+                            padding: '12px 16px',
+                            background: 'rgba(96,165,250,0.04)',
+                        }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                                <strong style={{ fontSize: 14 }}>
+                                    <span style={{ color: '#94a3b8', fontWeight: 400, marginRight: 6 }}>{matched.length + i + 1}.</span>
+                                    {item.name}
+                                </strong>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                    <span className="badge-sm info">条件已确认</span>
+                                    <span className="badge-sm warning">方法待核查</span>
+                                </div>
+                            </div>
+                            <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 4 }}>
+                                <span style={{ marginRight: 6 }}>细则要求方法：</span>
+                                <span style={{ color: '#fbbf24' }}>—（有条件项，细则未单独列出方法要求）</span>
+                            </div>
+                            <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                                <span style={{ marginRight: 6 }}>报告使用方法：</span>
+                                {reportMethod && reportMethod !== '未识别'
+                                    ? <span className="badge-sm success">{reportMethod}</span>
+                                    : <span className="badge-sm warning">未识别</span>
+                                }
+                            </div>
+                        </div>
+                    )
+                })}
             </div>
         </div>
     )
 }
 
 /* ───────── 标准指标合理性 Tab ───────── */
-function StandardComplianceTab({ result, onJumpToPdf }) {
+function StandardComplianceTab({ result, onJumpToPdf, overrides = {}, setOverrides }) {
     const rag = (result.summary || {}).ragflow_verification || {}
     const indicatorIssues = rag.indicator_issues || []
     const reportItems = result.items || []
     const indicatorEvidence = (rag.evidence || []).filter(e => e.type === 'indicator')
     const matchedItems = rag.matched_items || []
     const gbValidation = (result.summary || {}).gb_validation || {}
+    const conditional = rag.conditional_items || []
+    const [nonCompliantTarget, setNonCompliantTarget] = useState(null) // item key pending non-compliant dialog
 
     const reportValueMap = {}
     reportItems.forEach(item => {
         const key = (item.item || '').trim()
         if (key) reportValueMap[key] = item
     })
+
+    // condition_met 项需要加入指标核查（如果 indicatorEvidence 中还没有）
+    const evidenceItemNames = new Set(indicatorEvidence.map(e => e.item))
+    const conditionMetExtras = conditional.filter(item =>
+        item.name &&
+        overrides[item.name] === 'condition_met' &&
+        !evidenceItemNames.has(item.name)
+    )
 
     const NOT_FOUND = ['未找到限量值', '未提取', '未查到', '–', '']
     const isFound = s => s && !NOT_FOUND.includes(s.trim())
@@ -932,7 +1151,7 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
 
     const hasEvidence = indicatorEvidence.length > 0
 
-    if (!hasEvidence && matchedItems.length === 0) {
+    if (!hasEvidence && matchedItems.length === 0 && conditionMetExtras.length === 0) {
         return <div className="info-scrim">暂无指标对比数据</div>
     }
 
@@ -941,7 +1160,7 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
             {/* 表1：计量单位核查（只看单位是否一致） */}
             <div className="section-block">
                 <h3 className="block-title">计量单位核查</h3>
-                {hasEvidence ? (
+                {(hasEvidence || conditionMetExtras.length > 0) ? (
                     <div className="table-container">
                         <table className="clean-table" style={{ width: '100%' }}>
                             <thead>
@@ -983,6 +1202,22 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                                         </tr>
                                     )
                                 })}
+                                {conditionMetExtras.map((item, i) => {
+                                    const reportItem = reportValueMap[item.name] || {}
+                                    const reportUnit = reportItem.unit || '–'
+                                    return (
+                                        <tr key={`cond-unit-${i}`} style={{ background: 'rgba(96,165,250,0.04)' }}>
+                                            <td style={{ textAlign: 'center', color: '#94a3b8' }}>{indicatorEvidence.length + i + 1}</td>
+                                            <td>
+                                                {item.name}
+                                                <span className="badge-sm info" style={{ marginLeft: 6 }}>条件已确认</span>
+                                            </td>
+                                            <td>{reportUnit}</td>
+                                            <td style={{ color: '#fbbf24' }}>待查询</td>
+                                            <td style={{ fontSize: 11, color: '#94a3b8' }}>—</td>
+                                        </tr>
+                                    )
+                                })}
                             </tbody>
                         </table>
                     </div>
@@ -994,7 +1229,7 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
             {/* 表2：实测值范围核查 */}
             <div className="section-block">
                 <h3 className="block-title">实测值范围核查</h3>
-                {hasEvidence ? (
+                {(hasEvidence || conditionMetExtras.length > 0) ? (
                     <div className="table-container">
                         <table className="clean-table" style={{ width: '100%' }}>
                             <thead>
@@ -1011,36 +1246,85 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                                 {indicatorEvidence.map((ev, i) => {
                                     const reportItem = reportValueMap[ev.item] || {}
                                     const measureVal = reportItem.value || reportItem.result || '–'
-                                    // 报告中扫描出的标准指标（"标准指标"列）
                                     const reportStd = reportItem.standard || '–'
-                                    // 国标中提取的标准指标（纯数值/范围，无单位）
                                     const gbStd = ev.standard_value || '未查到'
+                                    const stdUnit = ev.standard_unit || '–'
                                     const gbStdFound = isFound(gbStd)
-                                    const reportStdFound = isFound(reportStd)
 
-                                    const compliance = _checkCompliance(measureVal, reportStd, gbStd)
-                                    const isIssue = indicatorIssues.some(iss => iss.includes(ev.item))
+                                    const autoClass = _classifyRow(measureVal, reportStd, gbStd, stdUnit)
+                                    const choiceKey = `__ev_choice__${ev.item}`
+                                    const choice = overrides[choiceKey]
+                                    const isYellow = autoClass === 'missing_standard' || autoClass === 'missing_unit'
+
+                                    // 决定最终显示的 badge
                                     let badgeClass, badgeText
-                                    if (compliance === 'inconsistent' || isIssue) {
-                                        badgeClass = isIssue ? 'error' : 'warning'
-                                        badgeText = '指标不符'
-                                    } else if (compliance === 'compliant') {
-                                        badgeClass = 'success'; badgeText = '合规'
-                                    } else {
-                                        badgeClass = 'warning'; badgeText = '无法判断'
-                                    }
+                                    if (choice) {
+                                        if (choice === 'compliant') { badgeClass = 'success'; badgeText = '合规' }
+                                        else if (choice === 'exceeded') { badgeClass = 'error'; badgeText = '指标超标' }
+                                        else if (choice === 'unit_mismatch') { badgeClass = 'error'; badgeText = '单位不符' }
+                                        else { badgeClass = 'error'; badgeText = '指标不符' }
+                                    } else if (autoClass === 'compliant') { badgeClass = 'success'; badgeText = '合规' }
+                                    else if (autoClass === 'exceeded') { badgeClass = 'error'; badgeText = '指标超标' }
+                                    else if (autoClass === 'standard_mismatch') { badgeClass = 'error'; badgeText = '指标不符' }
+                                    else if (autoClass === 'missing_unit') { badgeClass = 'warning'; badgeText = '单位缺失' }
+                                    else { badgeClass = 'warning'; badgeText = '指标缺失' }
+
                                     return (
                                         <tr key={i}>
                                             <td style={{ textAlign: 'center', color: '#94a3b8' }}>{i + 1}</td>
                                             <td>{ev.item}</td>
                                             <td>{measureVal}</td>
-                                            <td style={{ color: compliance === 'inconsistent' ? '#f97316' : 'inherit' }}>
+                                            <td style={{ color: autoClass === 'standard_mismatch' ? '#f97316' : 'inherit' }}>
                                                 {reportStd}
                                             </td>
                                             <td style={{ fontSize: 12, color: !gbStdFound ? '#fbbf24' : 'inherit' }}>
                                                 {gbStdFound ? gbStd : '未查到'}
                                             </td>
-                                            <td><span className={`badge-sm ${badgeClass}`}>{badgeText}</span></td>
+                                            <td>
+                                                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, alignItems: 'flex-start' }}>
+                                                    <span className={`badge-sm ${badgeClass}`}>{badgeText}</span>
+                                                    {isYellow && !choice && (
+                                                        <div style={{ display: 'flex', gap: 4, marginTop: 2 }}>
+                                                            <button
+                                                                className="badge-sm success"
+                                                                style={{ cursor: 'pointer', border: 'none', fontSize: 11 }}
+                                                                onClick={() => setOverrides && setOverrides(prev => ({ ...prev, [choiceKey]: 'compliant' }))}
+                                                            >合规</button>
+                                                            <button
+                                                                className="badge-sm error"
+                                                                style={{ cursor: 'pointer', border: 'none', fontSize: 11 }}
+                                                                onClick={() => setNonCompliantTarget(ev.item)}
+                                                            >不合规</button>
+                                                        </div>
+                                                    )}
+                                                    {isYellow && choice && (
+                                                        <button
+                                                            style={{ fontSize: 10, color: '#94a3b8', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
+                                                            onClick={() => setOverrides && setOverrides(prev => { const n = { ...prev }; delete n[choiceKey]; return n })}
+                                                        >撤销</button>
+                                                    )}
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    )
+                                })}
+                                {conditionMetExtras.map((item, i) => {
+                                    const reportItem = reportValueMap[item.name] || {}
+                                    const measureVal = reportItem.value || reportItem.result || '–'
+                                    const reportStd = reportItem.standard || '–'
+                                    return (
+                                        <tr key={`cond-${i}`} style={{ background: 'rgba(96,165,250,0.04)' }}>
+                                            <td style={{ textAlign: 'center', color: '#94a3b8' }}>{indicatorEvidence.length + i + 1}</td>
+                                            <td>
+                                                {item.name}
+                                                <span className="badge-sm info" style={{ marginLeft: 6 }}>条件已确认</span>
+                                            </td>
+                                            <td>{measureVal}</td>
+                                            <td>{reportStd}</td>
+                                            <td style={{ fontSize: 12, color: '#fbbf24' }}>待查询</td>
+                                            <td>
+                                                <span className="badge-sm warning">指标待核查</span>
+                                            </td>
                                         </tr>
                                     )
                                 })}
@@ -1056,6 +1340,7 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                             <table className="clean-table" style={{ width: '100%' }}>
                                 <thead>
                                     <tr>
+                                        <th style={{ width: 52, whiteSpace: 'nowrap' }}>序号</th>
                                         <th>检验项目（细则）</th>
                                         <th>报告项目名称</th>
                                         <th>报告测定值</th>
@@ -1068,6 +1353,7 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                                         const reportItem = reportValueMap[m.report_name] || reportValueMap[m.name] || {}
                                         return (
                                             <tr key={i}>
+                                                <td style={{ textAlign: 'center', color: '#94a3b8' }}>{i + 1}</td>
                                                 <td>{m.name || '–'}</td>
                                                 <td>{m.report_name || m.name || '–'}</td>
                                                 <td>{reportItem.value || reportItem.result || '–'}</td>
@@ -1093,6 +1379,53 @@ function StandardComplianceTab({ result, onJumpToPdf }) {
                     <div className="info-scrim">暂无指标对比数据</div>
                 )}
             </div>
+
+            {/* 不合规原因选择弹窗 */}
+            {nonCompliantTarget && (
+                <div onClick={() => setNonCompliantTarget(null)} style={{
+                    position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999
+                }}>
+                    <div onClick={e => e.stopPropagation()} style={{
+                        background: '#fff', borderRadius: 12, padding: '28px 32px', minWidth: 320,
+                        boxShadow: '0 20px 60px rgba(0,0,0,0.25)'
+                    }}>
+                        <h4 style={{ margin: '0 0 8px', fontSize: 16, color: '#1e293b' }}>选择不合规原因</h4>
+                        <p style={{ margin: '0 0 20px', fontSize: 13, color: '#64748b' }}>
+                            项目：<strong>{nonCompliantTarget}</strong>
+                        </p>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                            {[
+                                { key: 'standard_mismatch', label: '指标不符', desc: '报告标准指标与国标要求不一致' },
+                                { key: 'unit_mismatch', label: '单位不符', desc: '计量单位与国标要求不一致' },
+                                { key: 'exceeded', label: '指标超标', desc: '实测值超出国标限量范围' },
+                            ].map(opt => (
+                                <button key={opt.key} onClick={() => {
+                                    const choiceKey = `__ev_choice__${nonCompliantTarget}`
+                                    setOverrides && setOverrides(prev => ({ ...prev, [choiceKey]: opt.key }))
+                                    setNonCompliantTarget(null)
+                                }} style={{
+                                    display: 'flex', flexDirection: 'column', alignItems: 'flex-start',
+                                    padding: '12px 16px', borderRadius: 8, border: '1.5px solid #e2e8f0',
+                                    background: '#fafafa', cursor: 'pointer', textAlign: 'left',
+                                    transition: 'border-color 0.15s',
+                                }}
+                                    onMouseEnter={e => e.currentTarget.style.borderColor = '#ef4444'}
+                                    onMouseLeave={e => e.currentTarget.style.borderColor = '#e2e8f0'}
+                                >
+                                    <span style={{ fontWeight: 600, color: '#dc2626', fontSize: 14 }}>{opt.label}</span>
+                                    <span style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>{opt.desc}</span>
+                                </button>
+                            ))}
+                        </div>
+                        <button onClick={() => setNonCompliantTarget(null)} style={{
+                            marginTop: 16, width: '100%', padding: '8px', borderRadius: 6,
+                            border: '1px solid #e2e8f0', background: 'none', cursor: 'pointer',
+                            fontSize: 13, color: '#64748b'
+                        }}>取消</button>
+                    </div>
+                </div>
+            )}
         </div>
     )
 }
@@ -1387,9 +1720,9 @@ export default function ResultPage() {
                                         <div className="file-meta">
                                             <span className="file-name" title={r.filename}>{r.filename}</span>
                                             {(() => {
-                                                const { failedCount, unknownCount } = calculateModulesStatus(r.summary, allOverrides[i] || {})
+                                                const { failedCount, unknownCount, pendingReviewCount } = calculateModulesStatus(r.summary, allOverrides[i] || {}, r.items || [])
                                                 const risks = failedCount + unknownCount
-                                                return <span className="file-desc">{risks === 0 ? '无异常' : `${risks} 个风险项`}</span>
+                                                return <span className="file-desc">{pendingReviewCount > 0 ? '待审核' : risks === 0 ? '无异常' : `${risks} 个风险项`}</span>
                                             })()}
                                         </div>
                                     </div>
@@ -1448,8 +1781,8 @@ export default function ResultPage() {
                         {tab === 'summary' && <SummaryTab result={result} overrides={overrides} onSwitchTab={setTab} />}
                         {tab === 'standards' && <StandardsTab result={result} overrides={overrides} setOverrides={setOverrides} onJumpToPdf={jumpToPdf} />}
                         {tab === 'validation' && <ValidationTab result={result} onJumpToPdf={jumpToPdf} />}
-                        {tab === 'method_compliance' && <MethodComplianceTab result={result} onJumpToPdf={jumpToPdf} />}
-                        {tab === 'standard_compliance' && <StandardComplianceTab result={result} onJumpToPdf={jumpToPdf} />}
+                        {tab === 'method_compliance' && <MethodComplianceTab result={result} onJumpToPdf={jumpToPdf} overrides={overrides} />}
+                        {tab === 'standard_compliance' && <StandardComplianceTab result={result} onJumpToPdf={jumpToPdf} overrides={overrides} setOverrides={setOverrides} />}
                         {tab === 'package' && <PackageTab result={result} />}
                     </div>
                 </section>

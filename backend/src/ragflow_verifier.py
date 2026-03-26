@@ -666,7 +666,8 @@ def _extract_indicator_with_llm(
             "农药【" + item_name + "】的限量值。\n"
             "食品类别用'/'分隔，匹配到任意一个即可（按从精确到宽泛顺序优先）。\n\n"
             "重要提示：\n"
-            "- 限量值是纯数字，例如 0.01、0.02、0.1、0.5，通常在'限量'列\n"
+            "- 限量值必须带比较符号，格式如 <=0.01（代表 ≤0.01 mg/kg），通常在'限量'列\n"
+            "- 绝对不能只返回纯数字（如 0.01），必须加上 <= 前缀\n"
             "- '4.xxx' 是农药序号/章节号，绝对不是限量值\n"
             "- 英文名（如 chlorpyrifos、abamectin）是农药英文名，不是计量单位\n"
             "- GB 2763 计量单位统一为 mg/kg，无需从文本中推断\n"
@@ -681,11 +682,18 @@ def _extract_indicator_with_llm(
             + content_preview + "\n\n"
             "请从上述内容中找出食品【" + food_name + "】中检验项目【" + item_name + "】的标准限量值和计量单位。\n"
             "注意：\n"
-            "- 限量值是数字或范围，如 <=0.1、100~200、不得检出\n"
+            "- 限量值必须是带符号的范围或格式，不能只返回纯数字：\n"
+            "  * 最大限量：<=0.1 或 <0.1\n"
+            "  * 最小限量：>=100\n"
+            "  * 区间范围：100~200\n"
+            "  * 不得检出：0（致病菌）\n"
+            "  * 微生物采样计划：n=5,c=2,m=1000,M=10000 或 n=5,c=0,m=0（无M表示致病菌）\n"
             "- 计量单位如 mg/kg、mg/L、IU/100g、%、CFU/g 等\n"
             "- 页码、章节号不是限量值\n\n"
             "只返回 JSON（不要任何解释）：\n"
-            '找到时：{"standard_value": "<=0.1", "standard_unit": "mg/kg"}\n'
+            '普通限量示例：{"standard_value": "<=0.1", "standard_unit": "mg/kg"}\n'
+            '微生物示例：{"standard_value": "n=5,c=2,m=1000,M=10000", "standard_unit": "CFU/g"}\n'
+            '致病菌示例：{"standard_value": "n=5,c=0,m=0", "standard_unit": "CFU/25g"}\n'
             '未找到：{"standard_value": "未查到", "standard_unit": "-"}'
         )
 
