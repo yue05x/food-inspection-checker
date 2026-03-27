@@ -1619,55 +1619,13 @@ def verify_inspection_compliance(
             print(f"Error checking limit for {match_item.get('name')}: {e}")
             return None
 
-    # ── 按国标编号分组：GB 2763（农药）逐项，其余批量 ──────────────────────────
-    from collections import defaultdict
+    # 逐项并行查询（ThreadPoolExecutor）
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     evidence_list = []
-    batches_non2763 = defaultdict(list)   # query_code → [match_item, ...]
-    batches_2763    = []                  # 农药项目保留逐项查询
 
-    for m in items_to_check:
-        qc = m.get("required_basis", "").strip()
-        if not qc or not re.search(r'\d', qc):
-            for _gc in report_gb_codes:
-                if re.search(r'276[23]|232\d\d', _gc.replace(" ", "")):
-                    qc = _gc; break
-            if not qc or not re.search(r'\d', qc):
-                qc = report_gb_codes[0] if report_gb_codes else ""
-        if "2763" in qc.replace(" ", "") or "23200" in qc.replace(" ", ""):
-            batches_2763.append(m)
-        else:
-            batches_non2763[qc].append(m)
-
-    # ① 非农药标准：按标准批量查询（大幅减少 RAGflow + LLM 调用次数）
-    for query_code, batch_items in batches_non2763.items():
-        if not query_code:
-            for m in batch_items:
-                evidence_list.append(_make_not_found_evidence(m, ""))
-            continue
-
-        batch_evidence = _query_batch_for_standard(
-            query_code, batch_items, food_name, client, chat_client, config
-        )
-
-        # 逐条补充 indicator_issues
-        for ev in batch_evidence:
-            rname = ev.get("report_name", ev["item"])
-            report_item = report_map.get(rname, {})
-            limit_issue = _check_limit_compliance(
-                report_item.get("value"),
-                ev["standard_value"],
-                report_item.get("standard", ""),
-            )
-            if limit_issue:
-                indicator_issues.append(f"{ev['item']}: {limit_issue}")
-
-        evidence_list.extend(batch_evidence)
-
-    # ② GB 2763（农药）：保留逐项查询（结构复杂，目录+轮询策略不可批量化）
     with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_match = {executor.submit(_query_limit_worker, m): m for m in batches_2763}
+        future_to_match = {executor.submit(_query_limit_worker, m): m for m in items_to_check}
         for future in as_completed(future_to_match):
             match_item = future_to_match[future]
             res = future.result()
