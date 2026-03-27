@@ -1,201 +1,151 @@
-# InspeX - 食品检测报告智能验证系统
+# 食安智审 - 食品报告智能核查平台
 
-> 一个基于 AI 的食品检测报告自动化验证平台，提供国标合规性检查、检测项目核对、方法验证等全方位智能分析服务。
+> 食安智审 是一个专为食品安全领域打造的 **一体化报告自动化验证平台**。系统通过对 PDF 检测报告进行深度智能 OCR 解析，并结合 RAG（Retrieval-Augmented Generation）大语言模型与实时国标数据库，自动完成从**数据提取、标准核对到合规性验证**的全链路数据分析服务。
 
-## 📋 项目简介
+## ✨ 核心特性
 
-InspeX 通过 OCR 技术提取 PDF 检测报告信息，结合 RAGFlow 知识库和国标数据库，自动完成多维度合规性验证与风险识别。前端采用 **Vite + React**，后端为 **Flask 纯 REST API**。
-
-### 核心功能
-
-- 🔍 **智能 PDF 解析** — 基于 PaddleOCR 的高精度表格识别与数据提取
-- 📊 **多维度验证**
-  - 国标有效性验证（GB 标准状态、发布/实施日期，支持截图与下载）
-  - 检验项目合规性（基于食品安全监督抽检实施细则 RAGFlow 匹配）
-  - 检测方法合规性
-  - 标准指标合理性
-  - 评价依据合理性
-- 🤖 **RAGFlow 智能检索** — 向量数据库驱动的细则文档匹配
-- 📝 **附加信息管理** — 委托单、标签图片上传与核对
-- 📈 **可视化结果展示** — 7 个 Tab 的结构化报告 + PDF 内嵌预览
+- **📄 智能文档解析 (PaddleOCR + 启发式表格还原)**
+  - 高精度重构复杂 PDF 表格结构，自动解决跨行单元格、化学物质微小下标等传统解析痛点。
+- **🧠 知识库智能检索 (RAGFlow 集成)**
+  - 内置监督抽检实施细则的专属向量库。
+  - 通过大语言模型智能提取食品限量指标、检测单位及判定标准，消除“名称格式差异”导致的误判。
+- **⚖️ 全方位合规性评判**
+  - **国标生命周期检查**：自动检索国标 (GB) 现行状态、发布与实施日期，并支持旧版/作废国标溯源扫描，保留原生网页截图与源文件供下载。
+  - **动态指标判定**：精准判别“指标超标”与“标准不符”的差异化业务场景（支持企标严于国标的合理性校验）。
+  - **检测方法核对**：宽容度极高的文本防抖动匹配引擎，适配例如“方法号与子方法切分”等复杂业务场景。
+- **� 现代化交互体验 (React 18 + Vite)**
+  - 支持批量文件并行上传与验证。
+  - **7 维交互展示** + **同步 PDF 内联联动预览**，一键掌握检测项目、评价依据、标准判定等各项业务明细。
+- **📑 委托单与包装标签审定**
+  - 支持辅助上传企业产品委托单、包装图片，通过比对进一步核验源头合规性。
 
 ---
 
-## 🏗️ 项目结构
+## 🏗️ 平台技术栈
 
-```
+- **前端架构**：Vite + React 18 构建响应式界面，组件化渲染。
+- **后端服务**：Flask 驱动的纯 RESTful API 设计架构，高度解耦。
+- **OCR 引擎**：PaddleOCR + PyMuPDF。
+- **大模型核心**：RAGFlow (负责业务指标的 RAG 知识检索)。
+- **网页自动化**：Playwright (执行官网资料拉取与自动网页快照)。
+
+---
+
+## 🚀 部署指南与快速启动
+
+### 🛠 环境要求
+
+| 依赖模块 | 推荐版本 | 说明 |
+|----------|----------|------|
+| Python | 3.10+ | 后端核心服务支撑 |
+| Node.js | 18+ | 前端界面编译与运行 |
+| 存储空间 | ≥ 2 GB | 包含 PaddleOCR 预训练模型及本地缓存库 |
+
+### 1️⃣ 后端服务部署
+
+1. **环境准备与依赖安装**
+   ```powershell
+   cd backend
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+   playwright install chromium  # 安装国标截图所依赖的浏览器内核
+   ```
+
+2. **环境变量与配置**
+   复制示例配置并修改你的私密密钥：
+   ```bash
+   cp config.local.example.json config.local.json
+   ```
+   **`config.local.json` 示例参考：**
+   ```json
+   {
+       "RAGFLOW_API_URL": "http://你的_RAGFlow_IP_或_域名/v1",
+       "RAGFLOW_API_KEY": "RagFlow生成的专属API-KEY",
+       "RAGFLOW_KB_ID":   "实施细则知识库 ID",
+       "RAGFLOW_KB_ID_GB":"国标知识库 ID"
+   }
+   ```
+
+3. **导入必要的离线参考文件**
+   将业务相关的基础文件（如实施细则 PDF、国标 PDF 等）放入 `backend/static/files/` 目录。（例如：`2025年食品安全监督抽检实施细则.pdf`）
+
+4. **启动 Flask 服务**
+   ```powershell
+   .\.venv\Scripts\python.exe -m flask --app src/app.py run --port 5000
+   ```
+
+### 2️⃣ 前端服务部署
+
+开辟一个全新的独立终端：
+
+1. **安装前端包依赖**
+   ```powershell
+   cd frontend
+   npm install
+   ```
+
+2. **启动开发服务器**
+   ```powershell
+   npm run dev
+   ```
+   启动成功后浏览器访问： 👉 **`http://localhost:5173`** 即可进入系统主界面。
+
+---
+
+## � 核心目录结构
+
+```text
 extractionSystem/
-├── frontend/                     # React 前端（Vite + React 18）
+├── frontend/                     # React 前端工程
 │   ├── src/
 │   │   ├── pages/
-│   │   │   ├── UploadPage.jsx    # 文件上传页
-│   │   │   └── ResultPage.jsx    # 验证结果页（7 个 Tab）
-│   │   ├── components/
-│   │   │   └── DropZone.jsx      # 拖拽上传组件
-│   │   ├── App.jsx               # 路由配置
-│   │   └── style.css             # 全局样式
-│   └── vite.config.js            # Vite 配置（含 /api 代理）
+│   │   │   ├── UploadPage.jsx    # 工作台：文件上传与批量控制中心
+│   │   │   └── ResultPage.jsx    # 面板中心：7 大板块验证结果及 PDF 原卷关联预览
+│   │   ├── components/           # 复用组件库
+│   │   └── App.jsx               # 前端顶级路由拦截与页面分发
+│   └── vite.config.js            # 构建工具配置（含本机连调 /api 跨域代发）
 │
-└── backend/                      # Flask 后端（纯 REST API）
+└── backend/                      # Flask 纯 API 后段工程
     ├── src/
-    │   ├── app.py                # Flask 主程序 & API 路由
-    │   ├── field_extractor.py    # 字段提取
-    │   ├── html_table_parser.py  # HTML 表格解析
-    │   ├── table_merger.py       # 表格合并
-    │   ├── cell_parser.py        # 单元格解析
-    │   ├── item_name_matcher.py  # 项目名称匹配
-    │   ├── paddleocr_enhanced.py # OCR 增强
-    │   ├── pdf_reader.py         # PDF 读取
-    │   ├── ocr_engine.py         # OCR 接口
-    │   ├── business_logic_filter.py
-    │   ├── profile_inspection.py # 委托单处理
-    │   ├── package_image_processor.py
-    │   ├── ragflow_client.py     # RAGFlow API 客户端
-    │   ├── ragflow_verifier.py   # RAGFlow 核查逻辑
-    │   ├── gb_verifier/          # 国标验证模块
-    │   │   ├── __init__.py       # 批量验证入口（并行+缓存）
-    │   │   ├── runner.py         # Tavily 搜索 & 详情页解析
-    │   │   ├── validate.py       # 有效性判定逻辑
-    │   │   ├── screenshot.py     # Playwright 截图
-    │   │   ├── download.py       # 标准文件下载
-    │   │   └── html_extractor.py # HTML 数据提取
-    │   └── verifier2/            # 深度核查模块（CLI）
-    ├── static/                   # 运行时文件目录
-    │   ├── files/                # 参考 PDF（细则、国标）
-    │   ├── uploads/              # 上传的检测报告
-    │   ├── screenshots/          # 国标详情页截图
-    │   ├── downloads/            # 下载的国标文件
-    │   └── cache/                # 验证结果缓存
-    ├── requirements.txt
-    ├── requirements.production.txt
-    ├── gunicorn_config.py
-    ├── config.local.example.json
-    └── config.local.json         # 本地配置（含密钥，gitignored）
+    │   ├── app.py                # Flask 初始化、中间件绑定与路由分流
+    │   ├── html_table_parser.py  # 启发式表格算法 (处理多行异常/拆分容错)
+    │   ├── item_name_matcher.py  # 项目实体与字面名称抗抖动匹配
+    │   ├── paddleocr_enhanced.py # PaddleOCR 的二次封装与特定领域增强
+    │   ├── ragflow_client.py     # RAG 代理访问集成
+    │   ├── ragflow_verifier.py   # AI 大模型核心知识验证业务层
+    │   └── gb_verifier/          # 国标网络校验服务核心
+    │       ├── validate.py       # 状态验证策略执行
+    │       └── screenshot.py     # Playwright 网页抓取快照
+    ├── static/                   # 静态系统运行时 IO 目录 (日志/快照/下载/系统缓存)
+    └── config.local.json         # 加密配置环境
 ```
 
 ---
 
-## 🚀 快速开始
+## 📡 核心 API 与接口规范
 
-### 环境要求
+系统严格遵循前后端分离，以统一定义的 `/api/` 路由进行 JSON 协议握手。
 
-| 环境 | 版本 |
-|---|---|
-| Python | 3.10+ |
-| Node.js | 18+ |
-| 磁盘空间 | 约 2GB（含 OCR 模型） |
-
-### 1. 安装后端依赖
-
-```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-### 2. 配置环境
-
-```bash
-cp config.local.example.json config.local.json
-```
-
-编辑 `config.local.json`：
-
-```json
-{
-    "RAGFLOW_API_URL": "你的 RAGFlow API 地址",
-    "RAGFLOW_API_KEY": "你的 RAGFlow API 密钥",
-    "RAGFLOW_KB_ID":   "细则知识库 ID",
-    "RAGFLOW_KB_ID_GB":"国标知识库 ID"
-}
-```
-
-### 3. 准备参考文件
-
-将以下文件放入 `static/files/`：
-- `2025年食品安全监督抽检实施细则.pdf`
-- 需要参考的 GB 国标 PDF（如 `GB 2763-2021.pdf`）
-
-### 4. 安装前端依赖
-
-```powershell
-cd ../frontend
-npm install
-```
-
-### 5. 启动开发环境
-
-**需要同时开两个终端：**
-
-```powershell
-# 终端 1 — Flask 后端（端口 5000）
-cd backend
-.\.venv\Scripts\python.exe -m flask --app src/app.py run --port 5000
-
-# 终端 2 — Vite 前端（端口 5173）
-cd frontend
-npm run dev
-```
-
-浏览器访问：**`http://localhost:5173`**
-
----
-
-## 🔑 配置说明
-
-| 配置项 | 说明 | 必填 |
+| 通信谓词 | 访问路径 | 功能描述 |
 |---|---|---|
-| `RAGFLOW_API_URL` | RAGFlow API 服务地址 | ✅ |
-| `RAGFLOW_API_KEY` | RAGFlow API 密钥 | ✅ |
-| `RAGFLOW_KB_ID` | 细则知识库 ID | ✅ |
-| `RAGFLOW_KB_ID_GB` | 国标知识库 ID | ✅ |
-| `MCP_URL` | Tavily MCP 服务地址（国标验证）| 否 |
+| `POST` | `/api/upload` | 单/多文档分析核心口（解析、RAG 验证与判决报告生成） |
+| `POST` | `/api/check_gb_validity` | 按需式触发国标官网检查与状态强验证 |
+| `POST` | `/api/upload_protocol` | 处理用户委托单图文解析对接 |
+| `POST` | `/api/upload_label_info` | 校验包装标签，图谱匹配抽检标准 |
+| `GET`  | `/api/ragflow/*` | 系统级 RAG 数据库状态代理管道 |
 
----
-
-## 📡 API 文档
-
-所有接口均以 `/api/` 为前缀，返回 JSON。
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| `POST` | `/api/upload` | 上传 PDF 并执行全量分析 |
-| `POST` | `/api/process_pdf` | 处理单个 PDF（结果页追加）|
-| `POST` | `/api/check_gb_validity` | 手动触发国标有效性验证 |
-| `POST` | `/api/query_standards` | 查询细则检验项目 |
-| `POST` | `/api/upload_protocol` | 上传委托单 |
-| `POST` | `/api/upload_label_info` | 上传标签信息 |
-| `GET`  | `/api/ragflow/*` | RAGFlow 代理接口 |
-
-### 上传报告示例
-
-```http
-POST /api/upload
-Content-Type: multipart/form-data
-
-pdfs: <PDF文件>
-```
-
-**响应：**
+**返回规范 (针对核心的 `/upload`)：**
 ```json
 {
   "success": true,
   "results": [
     {
-      "filename": "SP202501824 黄瓜.pdf",
-      "status": "success",
-      "issue_count": 0,
-      "pdf_url": "/static/uploads/xxx.pdf",
-      "summary": {
-        "food_name": "黄瓜",
-        "production_date": "2025-01-01",
-        "gb_codes": ["GB 2763-2021"],
-        "gb_validation": { ... },
-        "ragflow_verification": { ... }
-      },
-      "items": [ ... ],
-      "issues": []
+       "status": "success",
+       "filename": "样例报告.pdf",
+       "summary": { "food_name": "...", "gb_validation": {} },
+       "items": [], 
+       "issues": []     // 全局警告、错误和不合规指控池
     }
   ]
 }
@@ -203,89 +153,21 @@ pdfs: <PDF文件>
 
 ---
 
-## 📦 生产部署
+## 📈 版本迭代亮点
 
-### 构建前端
+### 最新版本 (v2.1.0)
+- 🔬 **解析引擎巅峰升级**：彻底攻克 PDF 复杂表格墙（多行多列表格穿梭、微小化学式下标等）的大幅度脱框遗漏和提取缺陷。
+- 🤖 **RAG 调度与映射优化**：基于全新配置的抽取策略，实现国标限量数值、单位的精准逻辑纠错提取，从根本上解决系统“虚假数据缺失”漏查问题。
+- ⚖️ **更智能的合规裁决系统**：前端与后端的判读算法均进行了升级，目前能完美区分“指标超标（违法）”与“标准不符（严于国标的合理性校验）”的不同安全边界。
+- 📑 **国标数据完整度增强**：全生命周期的状态追踪！可以准确提取并缓存全量年代（包括已作废/即将实施）国标生命数据及源快照。
+- 🧩 **高容错核查模式**：对“检测方法命名法”、“段落分隔落差”、“子方法切分法”启用全新的文字抗抖动引擎匹配算法。
 
-```powershell
-cd frontend
-npm run build
-# 产物输出到 frontend/dist/，部署时由 Nginx 提供静态资源服务
-```
-
-### 启动 Flask（Gunicorn）
-
-```bash
-cd backend
-gunicorn -c gunicorn_config.py src.app:app
-```
-
-### Nginx 反向代理示例
-
-```nginx
-server {
-    listen 80;
-    server_name your-domain.com;
-
-    # 前端静态资源
-    root /path/to/frontend/dist;
-    index index.html;
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    # 后端 API
-    location /api/ {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-
-    # Flask 静态文件（截图/下载等）
-    location /static/ {
-        proxy_pass http://127.0.0.1:5000;
-    }
-}
-```
+### 初始架构化 (v2.0.0)
+- 🚀 前端工程架构进化为 **Vite + React 18**。
+- 🔌 Flask 核心瘦身重构为纯粹 REST API 后端，抹除模板渲染包袱。
+- ✨ 审查展示平台迭代：引入侧边三栏智能布局 + 高度集成的 7 大分类验证结果池。
+- 🗑️ 组件下架：剔除冗余和过时的 FastGPT 模块，将平台大模型驱动池独家锁定至更加专注的 RAGFlow。
 
 ---
 
-## ⚠️ 常见问题
-
-**Q: OCR 识别准确率不高？**
-确保 PDF 清晰度足够，避免扫描件模糊。可调整 `paddleocr_enhanced.py` 中参数。
-
-**Q: RAGFlow 连接失败？**
-检查 `config.local.json` 中的地址和密钥，确认 RAGFlow 服务正常运行。
-
-**Q: 国标验证截图功能不可用？**
-需要安装 Playwright：`playwright install chromium`
-
-**Q: 清理缓存？**
-删除 `static/cache/` 目录下的 JSON 文件即可，验证结果会在下次请求时重新获取。
-
----
-
-## 📈 更新日志
-
-### v2.0.0 (2026-03)
-- 🚀 前端迁移至 **Vite + React 18**，全面组件化
-- 🔌 Flask 重构为纯 REST API（去除 Jinja2 模板渲染）
-- ✨ 结果页重建：三栏布局 + 7 个 Tab + PDF 预览
-- 🗑️ 移除 FastGPT 集成，统一使用 RAGFlow
-- ⚡ verifier2 性能优化：跳过冗余 Tavily 调用
-
-### v1.0.0 (2026-02)
-- ✅ 核心验证功能发布
-- ✅ 集成 RAGFlow 智能检索
-- ✅ 国标验证（截图 + 下载 + 缓存）
-
----
-
-## 🙏 致谢
-
-- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — OCR 引擎
-- [RAGFlow](https://github.com/infiniflow/ragflow) — 检索增强生成框架
-- [Flask](https://flask.palletsprojects.com/) — Python Web 框架
-- [Vite](https://vitejs.dev/) + [React](https://react.dev/) — 现代前端工具链
-- [PyMuPDF](https://pymupdf.readthedocs.io/) — PDF 处理
+> _**食安智审** 结合了现代化的 OCR 技术和最新的大语言模型 RAG 工具，致力于成为检测行业标准的数字化守门员。_
