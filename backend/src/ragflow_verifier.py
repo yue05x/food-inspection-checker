@@ -684,17 +684,21 @@ def _extract_indicator_with_llm(
             "注意：\n"
             "- 限量值必须是带符号的范围或格式，不能只返回纯数字：\n"
             "  * 最大限量：<=0.1 或 <0.1\n"
-            "  * 最小限量：>=100\n"
-            "  * 区间范围：100~200\n"
+            "  * 最小限量：>=100 或 100~N.S.\n"
+            "  * 区间范围：100~200（若某端为N.S.则表示不设上/下限）\n"
             "  * 不得检出：0（致病菌）\n"
-            "  * 微生物采样计划：n=5,c=2,m=1000,M=10000 或 n=5,c=0,m=0（无M表示致病菌）\n"
-            "- 计量单位如 mg/kg、mg/L、IU/100g、%、CFU/g 等\n"
-            "- 页码、章节号不是限量值\n\n"
+            "  * 微生物采样计划：n=5,c=2,m=1000,M=10000 或 n=5,c=0,m=0（无M是致病菌）\n"
+            "- 计量单位请严格从表格列头中提取，常见格式：\n"
+            "  mg/kg、mg/100kJ、g/100kJ、μg/100kJ、μgRE/100kJ、mgα-TE/100kJ、\n"
+            "  mg/100g、μg/kg、μg/g、IU、%、CFU/g、/25g 等\n"
+            "  注意：μ 可能显示为 ug 或全角 μ，均属合法\n"
+            "- 若限量值是一个范围（如 0.43~0.96），请如实返回范围字符串\n"
+            "- 页码、章节号、检验方法名（如 GB4789.2）不是限量值\n\n"
             "只返回 JSON（不要任何解释）：\n"
-            '普通限量示例：{"standard_value": "<=0.1", "standard_unit": "mg/kg"}\n'
-            '微生物示例：{"standard_value": "n=5,c=2,m=1000,M=10000", "standard_unit": "CFU/g"}\n'
-            '致病菌示例：{"standard_value": "n=5,c=0,m=0", "standard_unit": "CFU/25g"}\n'
-            '未找到：{"standard_value": "未查到", "standard_unit": "-"}'
+            '{"standard_value": "<=0.1", "standard_unit": "mg/kg"}  // 最大值示例\n'
+            '{"standard_value": "0.43~0.96", "standard_unit": "g/100kJ"}  // 范围示例\n'
+            '{"standard_value": "n=5,c=2,m=1000,M=10000", "standard_unit": "CFU/g"}  // 微生物示例\n'
+            '{"standard_value": "未查到", "standard_unit": "-"}  // 未找到时'
         )
 
     print(f"\n{'='*60}")
@@ -718,6 +722,212 @@ def _extract_indicator_with_llm(
         print(f"  [LLM指标] 解析失败，回退正则: {e}")
 
     return NOT_FOUND
+
+
+def _make_not_found_evidence(match_item, query_code):
+    """生成"未查到"占位 evidence 条目"""
+    return {
+        "type": "indicator",
+        "item": match_item.get("name", ""),
+        "report_name": match_item.get("report_name", match_item.get("name", "")),
+        "content": "",
+        "extracted_limit": "未查到",
+        "standard_unit": "–",
+        "standard_value": "未查到",
+        "required_basis": query_code or match_item.get("required_basis", ""),
+        "chunk_id": None,
+        "page_num": None,
+        "doc_name": "",
+    }
+
+
+def _extract_indicators_batch_llm(limit_text, item_names, food_name, query_code, chat_client):
+    """
+    LLM 批量从国标文本中提取多个检验项目的标准限量值和计量单位。
+    返回: {item_name: {"standard_value": ..., "standard_unit": ...}}
+    """
+    import json as _json
+
+    NOT_FOUND_ITEM = {"standard_value": "未查到", "standard_unit": "–"}
+    result = {}
+
+    if not chat_client or not limit_text or not item_names:
+        return result
+
+    items_list_str = "\n".join(f"- {name}" for name in item_names)
+    content_preview = limit_text[:3500]
+
+    question = (
+        f"以下是从国标文件【{query_code}】检索到的原文内容：\n\n"
+        f"{content_preview}\n\n"
+        f"请从上述内容中，找出食品【{food_name}】中以下各检验项目的计量单位和标准限量值：\n"
+        f"{items_list_str}\n\n"
+        "规则：\n"
+        "- 限量值必须带比较符号或范围，禁止只返回纯数字：\n"
+        "  * 区间范围示例：0.43~0.96\n"
+        "  * 最大限量示例：<=0.5\n"
+        "  * 最小限量示例：>=12 或 12~N.S.\n"
+        "  * 微生物采样计划示例：n=5,c=2,m=1000,M=10000 或 n=5,c=0,m=0（无M为致病菌）\n"
+        "- 计量单位从表格列头提取，常见格式：g/100kJ、mg/100kJ、μg/100kJ、μgRE/100kJ、"
+        "mgα-TE/100kJ、%、CFU/g、mg/kg、/25g\n"
+        "- 页码、章节号（如4.121）、检验方法名（如GB4789.2）不是限量值\n"
+        "- 上述内容中未出现的项目：standard_value填'未查到'，standard_unit填'-'\n\n"
+        "只返回JSON对象（不要任何解释文字），以项目名为key：\n"
+        '{"蛋白质": {"standard_value": "0.43~0.96", "standard_unit": "g/100kJ"}, '
+        '"菌落总数": {"standard_value": "n=5,c=2,m=1000,M=10000", "standard_unit": "CFU/g"}, '
+        '"铅（以Pb计）": {"standard_value": "<=0.15", "standard_unit": "mg/kg"}, '
+        '"维生素K1": {"standard_value": "未查到", "standard_unit": "-"}}'
+    )
+
+    print(f"\n{'='*60}")
+    print(f"[批量LLM] 标准: {query_code}  食品: {food_name}  项目数: {len(item_names)}")
+    print(f"[批量LLM] 项目: {', '.join(item_names[:8])}{'...' if len(item_names) > 8 else ''}")
+    print(f"{'='*60}")
+
+    try:
+        resp = chat_client.ask(question)
+        if resp and resp.get("answer"):
+            answer = resp["answer"].strip()
+            m = re.search(r'\{[\s\S]+\}', answer)
+            if m:
+                data = _json.loads(m.group(0))
+                for name in item_names:
+                    if name in data:
+                        item_data = data[name]
+                    else:
+                        # 模糊匹配：去括号内容后比较
+                        name_clean = re.sub(r'[（(][^）)]*[）)]', '', name).strip()
+                        matched_key = next(
+                            (k for k in data
+                             if re.sub(r'[（(][^）)]*[）)]', '', k).strip() == name_clean),
+                            None
+                        )
+                        item_data = data.get(matched_key) if matched_key else None
+
+                    if isinstance(item_data, dict):
+                        sv = str(item_data.get("standard_value", "")).strip()
+                        su = str(item_data.get("standard_unit", "")).strip()
+                        result[name] = {
+                            "standard_value": sv or "未查到",
+                            "standard_unit": su or "–",
+                        }
+                        print(f"  ✔ {name}: value={sv}, unit={su}")
+                    else:
+                        result[name] = NOT_FOUND_ITEM.copy()
+                        print(f"  ✗ {name}: 未在LLM响应中找到")
+    except Exception as e:
+        print(f"  [批量LLM] 解析失败: {e}")
+        import traceback; traceback.print_exc()
+
+    return result
+
+
+def _query_batch_for_standard(query_code, batch_items, food_name, client, chat_client, config):
+    """
+    批量查询一个国标下所有匹配项目的限量值。
+    适用于产品标准（GB 10767、GB 2762、GB 29921 等），不适用于 GB 2763（农药）。
+
+    batch_items: [{"name":..., "report_name":..., "required_basis":..., ...}]
+    返回: list of evidence dicts（与 _query_limit_worker 返回格式相同）
+    """
+    kb_id_gb = config.get("RAGFLOW_KB_ID_GB")
+    item_names = [m["name"] for m in batch_items]
+
+    # ── 文档编号关键词（用于 doc_name 过滤）──────────────────────────────────
+    _num_match = re.search(r'(\d+(?:\.\d+)?)', query_code)
+    gb_num_key = _num_match.group(1) if _num_match else query_code
+
+    def _filter_by_doc(chunks):
+        return [c for c in (chunks or [])
+                if gb_num_key in c.get("doc_name", "").replace(" ", "")]
+
+    # ── Step 1: 收集该国标的相关 chunks ──────────────────────────────────────
+    seen_ids = set()
+    all_chunks = []
+
+    _cat_kws = get_food_categories(food_name) or [food_name]
+    food_kw = _cat_kws[0] if _cat_kws else food_name
+
+    # 宽泛查询（捕获整张表）
+    broad_queries = [f"{food_kw} 限量", f"{food_kw} 营养素"]
+    # 抽样项目查询（提升覆盖率，每隔 N 个取1个，最多6个）
+    step = max(1, len(item_names) // 4)
+    sample_names = item_names[::step][:6]
+    item_queries = [name for name in sample_names]
+
+    for q in broad_queries + item_queries:
+        raw = client.query(q, dataset_ids=[kb_id_gb], page_size=20) or []
+        for chunk in _filter_by_doc(raw):
+            cid = chunk.get("id") or chunk.get("chunk_id") or chunk.get("content", "")[:40]
+            if cid not in seen_ids:
+                seen_ids.add(cid)
+                all_chunks.append(chunk)
+
+    print(f"\n[批量查询] {query_code}: 收集 {len(all_chunks)} 个唯一chunks（项目数={len(item_names)}）")
+
+    if not all_chunks:
+        print(f"  [批量查询] 无内容，所有项目返回未查到")
+        return [_make_not_found_evidence(m, query_code) for m in batch_items]
+
+    # ── Step 2: 组合文本，确定代表性页码/文档名 ──────────────────────────────
+    sorted_chunks = sorted(all_chunks, key=lambda c: (c.get("page_num") or 999))
+    combined_text = "\n\n".join(c.get("content", "") for c in sorted_chunks if c.get("content"))
+    rep_doc_name = next((c.get("doc_name", "") for c in sorted_chunks if c.get("doc_name")), "")
+    page_nums = [c.get("page_num") for c in sorted_chunks if c.get("page_num")]
+    rep_page_num = min(page_nums) if page_nums else None
+
+    # ── Step 3: 批量 LLM 提取 ────────────────────────────────────────────────
+    batch_result = _extract_indicators_batch_llm(
+        combined_text, item_names, food_kw, query_code, chat_client
+    )
+
+    # ── Step 4: 校验 + 构造 evidence_list ────────────────────────────────────
+    _valid_unit_re = re.compile(
+        r'mg|\u03bcg|\u00b5g|ug|IU|%|g/|/kg|/L|/g|/100|cfu|mL|kJ|RE|TE|CFU|/25g',
+        re.IGNORECASE
+    )
+
+    evidence_list = []
+    for match_item in batch_items:
+        name = match_item["name"]
+        item_result = batch_result.get(name, {"standard_value": "未查到", "standard_unit": "–"})
+
+        sv = item_result["standard_value"]
+        su = item_result["standard_unit"]
+
+        # 拒绝章节号（4.xxx）和文档编号（如 10767）
+        sv_half = re.sub(r'[０-９]', lambda c: chr(ord(c.group(0)) - 0xFEE0), sv)
+        if re.match(r'^4\.\d+$', sv_half):
+            sv, su = "未查到", "–"
+        sv_digits = re.sub(r'[^\d]', '', sv_half)
+        if sv_digits and len(sv_digits) >= 4 and sv_digits == re.sub(r'[^\d]', '', gb_num_key):
+            sv, su = "未查到", "–"
+
+        # 拒绝无效单位（如检验方法名 GB4789.2）
+        if su not in ("–", "-", "", "未查到") and (
+            not _valid_unit_re.search(su) or re.search(r'GB\s*\d{4}', su, re.IGNORECASE)
+        ):
+            su = "–"
+
+        extracted_limit = "未查到" if sv == "未查到" else (
+            f"{sv} {su}" if su and su not in ("–", "-") else sv
+        )
+
+        evidence_list.append({
+            "type": "indicator",
+            "item": name,
+            "report_name": match_item.get("report_name", name),
+            "content": combined_text[:500],
+            "extracted_limit": extracted_limit,
+            "standard_unit": su,
+            "standard_value": sv,
+            "required_basis": query_code,
+            "chunk_id": None,
+            "page_num": rep_page_num,
+            "doc_name": rep_doc_name,
+        })
+
+    return evidence_list
 
 
 def verify_inspection_compliance(
@@ -1356,11 +1566,17 @@ def verify_inspection_compliance(
                         indicator_fields = {"standard_unit": "–", "standard_value": "未查到"}
                         _sv_half = ""
 
-                    # ③ 单位若为纯英文（农药英文名）也不是有效单位
+                    # ③ 单位若为纯英文（农药英文名）或纯数字则不是有效单位
                     _su = indicator_fields.get("standard_unit", "–").strip()
                     # μ 有两种 Unicode 编码：U+03BC（希腊字母）和 U+00B5（微符号），都要匹配
-                    _valid_unit_re = re.compile(r'mg|\u03bcg|\u00b5g|ug|IU|%|g/|/kg|/L|/g|cfu|mL|kJ', re.IGNORECASE)
-                    if _su not in ("–", "-", "", "未查到") and not _valid_unit_re.search(_su):
+                    # 扩展正则：覆盖 /100kJ 格式、μgRE、mgα-TE、CFU 等常见单位
+                    _valid_unit_re = re.compile(
+                        r'mg|\u03bcg|\u00b5g|ug|IU|%|g/|/kg|/L|/g|/100|cfu|mL|kJ|RE|TE|CFU|/25g',
+                        re.IGNORECASE
+                    )
+                    # 检测方法名误判：如 "GB4789.2" 或 "GB 4789" 不是有效单位
+                    _is_method_name = bool(re.search(r'GB\s*\d{4}', _su, re.IGNORECASE))
+                    if _su not in ("–", "-", "", "未查到") and (not _valid_unit_re.search(_su) or _is_method_name):
                         print(f"  [校验] 拒绝无效单位 '{_su}'，置为未知")
                         indicator_fields["standard_unit"] = "–"
 
@@ -1389,6 +1605,7 @@ def verify_inspection_compliance(
                     return {
                         "type": "success",
                         "item_name": item_name,
+                        "report_name": report_name,  # 报告中的实际名称，用于前端匹配
                         "limit_text": limit_text,
                         "extracted_limit": extracted_limit,
                         "standard_unit": indicator_fields["standard_unit"],
@@ -1402,13 +1619,55 @@ def verify_inspection_compliance(
             print(f"Error checking limit for {match_item.get('name')}: {e}")
             return None
 
-    # Use ThreadPoolExecutor for parallel queries
+    # ── 按国标编号分组：GB 2763（农药）逐项，其余批量 ──────────────────────────
+    from collections import defaultdict
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    
+
     evidence_list = []
-    
+    batches_non2763 = defaultdict(list)   # query_code → [match_item, ...]
+    batches_2763    = []                  # 农药项目保留逐项查询
+
+    for m in items_to_check:
+        qc = m.get("required_basis", "").strip()
+        if not qc or not re.search(r'\d', qc):
+            for _gc in report_gb_codes:
+                if re.search(r'276[23]|232\d\d', _gc.replace(" ", "")):
+                    qc = _gc; break
+            if not qc or not re.search(r'\d', qc):
+                qc = report_gb_codes[0] if report_gb_codes else ""
+        if "2763" in qc.replace(" ", "") or "23200" in qc.replace(" ", ""):
+            batches_2763.append(m)
+        else:
+            batches_non2763[qc].append(m)
+
+    # ① 非农药标准：按标准批量查询（大幅减少 RAGflow + LLM 调用次数）
+    for query_code, batch_items in batches_non2763.items():
+        if not query_code:
+            for m in batch_items:
+                evidence_list.append(_make_not_found_evidence(m, ""))
+            continue
+
+        batch_evidence = _query_batch_for_standard(
+            query_code, batch_items, food_name, client, chat_client, config
+        )
+
+        # 逐条补充 indicator_issues
+        for ev in batch_evidence:
+            rname = ev.get("report_name", ev["item"])
+            report_item = report_map.get(rname, {})
+            limit_issue = _check_limit_compliance(
+                report_item.get("value"),
+                ev["standard_value"],
+                report_item.get("standard", ""),
+            )
+            if limit_issue:
+                indicator_issues.append(f"{ev['item']}: {limit_issue}")
+
+        evidence_list.extend(batch_evidence)
+
+    # ② GB 2763（农药）：保留逐项查询（结构复杂，目录+轮询策略不可批量化）
     with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_match = {executor.submit(_query_limit_worker, m): m for m in items_to_check}
+        future_to_match = {executor.submit(_query_limit_worker, m): m for m in batches_2763}
         for future in as_completed(future_to_match):
             match_item = future_to_match[future]
             res = future.result()
@@ -1416,32 +1675,22 @@ def verify_inspection_compliance(
                 evidence_list.append({
                     "type": "indicator",
                     "item": res["item_name"],
+                    "report_name": res.get("report_name", res["item_name"]),
                     "content": res["limit_text"],
                     "extracted_limit": res.get("extracted_limit", "未提取"),
                     "standard_unit": res.get("standard_unit", "–"),
                     "standard_value": res.get("standard_value", "未查到"),
-                    "required_basis": res.get("query_code", ""),  # 用于前端跳转到正确 PDF
+                    "required_basis": res.get("query_code", ""),
                     "chunk_id": res["best_chunk"].get("chunk_id"),
                     "page_num": res["best_chunk"].get("page_num"),
                     "doc_name": res["best_chunk"].get("doc_name", "")
                 })
-                # 如果有问题，添加到问题列表
                 if res.get("limit_issue"):
                     indicator_issues.append(f"{res['item_name']}: {res['limit_issue']}")
             else:
-                # 查询失败也加入证据列表，确保前端显示所有检验项目
-                evidence_list.append({
-                    "type": "indicator",
-                    "item": match_item.get("name", ""),
-                    "content": "",
-                    "extracted_limit": "未查到",
-                    "standard_unit": "–",
-                    "standard_value": "未查到",
-                    "required_basis": match_item.get("required_basis", ""),
-                    "chunk_id": None,
-                    "page_num": None,
-                    "doc_name": ""
-                })
+                evidence_list.append(_make_not_found_evidence(
+                    match_item, match_item.get("required_basis", "")
+                ))
 
     # Merge evidence
     result["evidence"].extend(evidence_list)

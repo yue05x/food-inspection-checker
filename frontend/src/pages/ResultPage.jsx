@@ -10,7 +10,7 @@ const _normStr = s => (s || '').replace(/\s/g, '')
     .replace(/[∶：]/g, ':')
 
 // 解析标准范围字符串 → {min?, max?} 或 null（无法解析返回 null）
-// 支持：≤0.5 / ≥12 / 0.07~0.33 / N.S.a~20
+// 支持：≤0.5 / ≥12 / 0.07~0.33 / N.S.a~20（N.S. 端表示不设该侧限制）
 // 不支持：比值（含":"）、纯文字
 const _parseRange = rawStr => {
     const n = _normStr(rawStr).replace(/[％%]/g, '')
@@ -20,12 +20,18 @@ const _parseRange = rawStr => {
     if (m) return { max: parseFloat(m[1]) }
     m = n.match(/^[≥>]([\d.]+)/)
     if (m) return { min: parseFloat(m[1]) }
-    // a~b（兼容前缀文字，如 N.S.a~20 → max=20）
+    // a~b（N.S. 一端表示不设限 → 该端返回 undefined）
     const parts = n.split('~')
     if (parts.length === 2) {
-        const mins = [...parts[0].matchAll(/([\d.]+)/g)].map(x => parseFloat(x[1]))
-        const maxs = [...parts[1].matchAll(/([\d.]+)/g)].map(x => parseFloat(x[1]))
-        if (maxs.length > 0) return { ...(mins.length > 0 ? { min: mins[mins.length - 1] } : {}), max: maxs[maxs.length - 1] }
+        // N.S./NS 开头视为不设限，纯字母前缀也视为不设限
+        const isNS = s => /N\.?S\.?/i.test(s) || /^[a-zA-Z]/.test(s.trim())
+        const loNums = [...parts[0].matchAll(/([\d.]+)/g)].map(x => parseFloat(x[1]))
+        const hiNums = [...parts[1].matchAll(/([\d.]+)/g)].map(x => parseFloat(x[1]))
+        const minVal = (!isNS(parts[0]) && loNums.length > 0) ? loNums[loNums.length - 1] : undefined
+        const maxVal = (!isNS(parts[1]) && hiNums.length > 0) ? hiNums[hiNums.length - 1] : undefined
+        if (minVal !== undefined || maxVal !== undefined) {
+            return { ...(minVal !== undefined ? { min: minVal } : {}), ...(maxVal !== undefined ? { max: maxVal } : {}) }
+        }
     }
     return null  // 单个纯数字或其他格式 → 语义不明，跳过
 }
@@ -151,17 +157,18 @@ function _checkCompliance(measureVal, reportStd, gbStd) {
         }
     }
 
-    // ② 报告标准范围 ⊆ 国标范围
+    // ② 报告标准范围 vs 国标范围
     if (repFound) {
         const repRange = _parseRange(reportStd)
         if (repRange && gbRange) {
-            const minOk = gbRange.min === undefined || repRange.min === undefined || repRange.min >= gbRange.min
+            // 只检查"报告上限 ≤ 国标上限"——报告下限高于国标下限是更严格，不是超标
+            // 报告上限超过国标上限 → 指标不符（允许值范围比国标宽）
             const maxOk = gbRange.max === undefined || repRange.max === undefined || repRange.max <= gbRange.max
-            return (minOk && maxOk) ? 'compliant' : 'inconsistent'
+            return maxOk ? 'compliant' : 'inconsistent'
         }
         // ③ 字符串归一化比较（剥离 ≤/≥ 前缀）
         const normV = s => _normStr(s).replace(/^[≤<≥>]/u, '')
-        return normV(reportStd) === normV(gbStd) ? 'compliant' : 'inconsistent'
+        return normV(reportStd) === normV(gbStd) ? 'compliant' : 'unknown'
     }
 
     return 'unknown'  // 无实测值、无报告标准，无法判断
@@ -169,55 +176,50 @@ function _checkCompliance(measureVal, reportStd, gbStd) {
 
 // 实测值范围核查行分类
 // 返回: 'compliant'|'exceeded'|'standard_mismatch'|'missing_standard'|'missing_unit'
+// 注意：单位缺失不阻断数值比较——只有在数值/字符串比较均无法判断时才降级为 missing_unit
 function _classifyRow(measureVal, reportStd, gbStd, stdUnit) {
     const NOT_FOUND = new Set(['未找到限量值', '未提取', '未查到', '–', ''])
-    const gbFound   = gbStd    && !NOT_FOUND.has(gbStd.trim())
-    const unitFound = stdUnit  && stdUnit !== '–' && stdUnit.trim() !== ''
+    const gbFound = gbStd && !NOT_FOUND.has(gbStd.trim())
+    const unitFound = stdUnit && stdUnit !== '–' && stdUnit.trim() !== ''
 
-    if (!unitFound) return 'missing_unit'
-    if (!gbFound)   return 'missing_standard'
+    // 国标指标完全没查到 → 指标缺失（不受单位影响）
+    if (!gbFound) return 'missing_standard'
 
     const gbRange = _parseRange(gbStd)
     const measNum = _parseMeasNum(measureVal)
 
-    // ① 优先：直接数值比较（最可靠）—— 实测值 vs 国标范围
+    // ① 优先：直接数值比较（最可靠，不依赖单位字段）
     if (gbRange && measNum !== null) {
         const minOk = gbRange.min === undefined || measNum >= gbRange.min
         const maxOk = gbRange.max === undefined || measNum <= gbRange.max
         return (minOk && maxOk) ? 'compliant' : 'exceeded'
     }
 
-    // ② 使用综合判断（含微生物计划、报告标准方向推断、字符串比较等）
+    // ② 综合判断（含微生物 n/c/m/M、报告标准方向推断、字符串比较等）
     const compliance = _checkCompliance(measureVal, reportStd, gbStd)
 
     if (compliance === 'compliant') {
-        // 最终安全校验：若实测值和国标数字可解析，确认实测值未超标
-        if (measNum !== null) {
-            const gbNum = parseFloat(_normStr(gbStd).replace(/[^0-9.]/g, ''))
-            if (!isNaN(gbNum)) {
-                const rn = _normStr(reportStd || gbStd)
-                if (/^[≤<]/.test(rn) && measNum > gbNum) return 'exceeded'
-                if (/^[≥>]/.test(rn) && measNum < gbNum) return 'exceeded'
-            }
-        }
         return 'compliant'
     }
 
     if (compliance === 'inconsistent') {
-        // 区分「指标超标」（实测值超出限量）vs「指标不符」（标准范围引用错误）
+        // 区分「指标超标」vs「指标不符」
+        // 只有当实测值本身超出国标单侧限值（≤X 或 ≥X）时才是「超标」，否则是「指标不符」
         if (measNum !== null) {
-            const gbNum = parseFloat(_normStr(gbStd).replace(/[^0-9.]/g, ''))
-            if (!isNaN(gbNum)) {
-                const rn = _normStr(reportStd || gbStd)
-                if (/^[≤<]/.test(rn) && measNum > gbNum) return 'exceeded'
-                if (/^[≥>]/.test(rn) && measNum < gbNum) return 'exceeded'
+            const gbR = _parseRange(gbStd)
+            if (gbR) {
+                const maxOk = gbR.max === undefined || measNum <= gbR.max
+                const minOk = gbR.min === undefined || measNum >= gbR.min
+                if (!maxOk || !minOk) return 'exceeded'
             }
         }
         return 'standard_mismatch'
     }
 
-    // compliance === 'unknown'：国标已找到，但无法数值判断 → 黄色待审核
-    return 'missing_standard'
+    // compliance === 'unknown'：国标存在但所有数值路径均无法判断
+    // 此时若单位也缺失，归为 missing_unit（提示用户单位信息不足）
+    // 否则归为 missing_standard（有单位但指标内容无法比较）
+    return unitFound ? 'missing_standard' : 'missing_unit'
 }
 
 /* ───────── 工具函数 ───────── */
@@ -248,18 +250,18 @@ function calculateModulesStatus(s, overrides = {}, items = []) {
     })
 
     const isYellow = cls => cls === 'missing_standard' || cls === 'missing_unit'
-    const isRed    = cls => cls === 'exceeded' || cls === 'standard_mismatch'
+    const isRed = cls => cls === 'exceeded' || cls === 'standard_mismatch'
 
     let anyUnresolvedYellow = false
     let anyRed = false
     indicatorEvidence.forEach(ev => {
         const ri = reportValueMap[ev.item] || {}
         const measureVal = ri.value || ri.result || '–'
-        const repStd     = ri.standard || '–'
-        const gbStd      = ev.standard_value || ''
-        const stdUnit    = ev.standard_unit  || ''
-        const choice     = overrides[`__ev_choice__${ev.item}`]
-        const autoClass  = _classifyRow(measureVal, repStd, gbStd, stdUnit)
+        const repStd = ri.standard || '–'
+        const gbStd = ev.standard_value || ''
+        const stdUnit = ev.standard_unit || ''
+        const choice = overrides[`__ev_choice__${ev.item}`]
+        const autoClass = _classifyRow(measureVal, repStd, gbStd, stdUnit)
 
         if (choice) {
             if (choice !== 'compliant') anyRed = true
@@ -305,7 +307,7 @@ function calculateModulesStatus(s, overrides = {}, items = []) {
     const missingComp = ragComp.missing_items || []
     const conditionalComp = ragComp.conditional_items || []
     const unresolvedCondComp = conditionalComp.filter(item => !overrides[item.name]).length
-    const rejectedCondComp   = conditionalComp.filter(item => overrides[item.name] === 'rejected').length
+    const rejectedCondComp = conditionalComp.filter(item => overrides[item.name] === 'rejected').length
     let stdComplianceStatus
     if (missingComp.length > 0 || rejectedCondComp > 0) {
         // 缺失项或已拒绝的有条件项 → 红色，直接未通过（优先于待审核）
@@ -619,8 +621,8 @@ function ValidationTab({ result, onJumpToPdf }) {
                                             <td><strong>{code}</strong></td>
                                             <td>
                                                 <span className={`badge-sm ${(v.status === 'valid' || (v.status_text && v.status_text.includes('现行') && v.status_text.includes('有效'))) ? 'success'
-                                                        : (v.status === 'error' || v.status === 'unknown') ? 'warning'
-                                                            : 'error'
+                                                    : (v.status === 'error' || v.status === 'unknown') ? 'warning'
+                                                        : 'error'
                                                     }`}>
                                                     {v.status_text || (v.status === 'valid' ? '现行有效' : v.status === 'error' ? '验证失败' : v.status === 'unknown' ? '未知' : '已废止/无效')}
                                                 </span>
@@ -749,10 +751,10 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
     // 统计各类数量
     // condition_met: 满足条件已检测（计入匹配）; condition_not_applicable: 不满足条件无需检测; 'allowed': 旧值兼容
     const _isAllowed = v => v === 'allowed' || v === 'condition_met' || v === 'condition_not_applicable'
-    const conditionMetCount         = conditional.filter(item => item.name && (overrides[item.name] === 'condition_met' || overrides[item.name] === 'allowed')).length
-    const conditionNACount          = conditional.filter(item => item.name && overrides[item.name] === 'condition_not_applicable').length
-    const allowedConditionalCount   = conditionMetCount + conditionNACount
-    const rejectedConditionalCount  = conditional.filter(item => item.name && overrides[item.name] === 'rejected').length
+    const conditionMetCount = conditional.filter(item => item.name && (overrides[item.name] === 'condition_met' || overrides[item.name] === 'allowed')).length
+    const conditionNACount = conditional.filter(item => item.name && overrides[item.name] === 'condition_not_applicable').length
+    const allowedConditionalCount = conditionMetCount + conditionNACount
+    const rejectedConditionalCount = conditional.filter(item => item.name && overrides[item.name] === 'rejected').length
     const unresolvedConditionalCount = conditional.filter(item => !overrides[item.name]).length
     const effectiveMatchedCount = matched.length + conditionMetCount  // 只有已检测项计入匹配
 
@@ -851,14 +853,14 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
                             </tr>
                         ))}
                         {conditional.map((item, i) => {
-                            const decision   = overrides[item.name]
+                            const decision = overrides[item.name]
                             const isRejected = decision === 'rejected'
                             const isResolved = _isAllowed(decision)
                             const rowBg = isResolved ? (decision === 'condition_not_applicable' ? 'rgba(96,165,250,0.05)' : 'rgba(74,222,128,0.05)')
-                                        : isRejected ? 'rgba(239,68,68,0.05)'
-                                        : 'rgba(251,191,36,0.05)'
+                                : isRejected ? 'rgba(239,68,68,0.05)'
+                                    : 'rgba(251,191,36,0.05)'
                             const clearDecision = () => setOverrides(prev => { const n = { ...prev }; delete n[item.name]; return n })
-                            const setDecision   = (val) => setOverrides(prev => ({ ...prev, [item.name]: val }))
+                            const setDecision = (val) => setOverrides(prev => ({ ...prev, [item.name]: val }))
                             return (
                                 <tr key={`cond-${i}`} style={{ background: rowBg }}>
                                     <td style={{ color: '#64748b', fontSize: 12, textAlign: 'center' }}>{matched.length + missing.length + i + 1}</td>
@@ -882,7 +884,7 @@ function StandardsTab({ result, onJumpToPdf, overrides, setOverrides }) {
                                             : <div style={{ display: 'flex', gap: 4, marginTop: 2 }}>
                                                 <button className="badge-sm success" style={{ cursor: 'pointer', border: 'none', fontSize: 11 }} onClick={() => setPendingAllowTarget(item.name)}>允许通过</button>
                                                 <button className="badge-sm error" style={{ cursor: 'pointer', border: 'none', fontSize: 11 }} onClick={() => setDecision('rejected')}>不允许通过</button>
-                                              </div>
+                                            </div>
                                         }
                                     </td>
                                 </tr>
@@ -1174,7 +1176,7 @@ function StandardComplianceTab({ result, onJumpToPdf, overrides = {}, setOverrid
                             </thead>
                             <tbody>
                                 {indicatorEvidence.map((ev, i) => {
-                                    const reportItem = reportValueMap[ev.item] || {}
+                                    const reportItem = reportValueMap[ev.report_name] || reportValueMap[ev.item] || {}
                                     const reportUnit = reportItem.unit || '–'
                                     const stdUnit = ev.standard_unit || '–'
                                     const unitOk = isFound(stdUnit)
@@ -1244,7 +1246,7 @@ function StandardComplianceTab({ result, onJumpToPdf, overrides = {}, setOverrid
                             </thead>
                             <tbody>
                                 {indicatorEvidence.map((ev, i) => {
-                                    const reportItem = reportValueMap[ev.item] || {}
+                                    const reportItem = reportValueMap[ev.report_name] || reportValueMap[ev.item] || {}
                                     const measureVal = reportItem.value || reportItem.result || '–'
                                     const reportStd = reportItem.standard || '–'
                                     const gbStd = ev.standard_value || '未查到'
