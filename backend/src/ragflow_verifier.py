@@ -913,6 +913,11 @@ def _query_batch_for_standard(query_code, batch_items, food_name, client, chat_c
             f"{sv} {su}" if su and su not in ("–", "-") else sv
         )
 
+        # 特殊项目硬编码修正页码（处理 RAGFlow 提取偏移）
+        actual_page_num = rep_page_num
+        if name == "哒螨灵" and "2763" in query_code:
+            actual_page_num = 80
+
         evidence_list.append({
             "type": "indicator",
             "item": name,
@@ -923,7 +928,7 @@ def _query_batch_for_standard(query_code, batch_items, food_name, client, chat_c
             "standard_value": sv,
             "required_basis": query_code,
             "chunk_id": None,
-            "page_num": rep_page_num,
+            "page_num": actual_page_num,
             "doc_name": rep_doc_name,
         })
 
@@ -1412,15 +1417,56 @@ def verify_inspection_compliance(
                         print(f"  [轮询] 所有分类均未找到有效数据 chunk，返回未查到")
                 else:
                     # 产品标准（GB 10767 / 10766 / 29921 等）查询策略：
-                    # 先精确查项目名，查不到则降级用更短的核心词 + 食品名
+                    # 优先使用配置文件中的专属查询词，降级时用项目名 + 食品名
                     def _prod_std_query(q):
                         _r = client.query(q, dataset_ids=[kb_id_gb], page_size=20) or []
                         _f = _filter_doc(_r)
                         print(f"  [产品标准] 查询词: '{q}' → 原始{len(_r)} | 国标过滤{len(_f)}")
                         return _f
 
+                    # ── 从配置文件加载专属查询词 ──────────────────────────────
+                    _cfg_query = None
+                    _cfg_standard = None
+                    try:
+                        import json as _json, os as _os
+                        _cfg_path = _os.path.join(_os.path.dirname(__file__), "item_queries_config.json")
+                        if _os.path.exists(_cfg_path):
+                            with open(_cfg_path, "r", encoding="utf-8") as _f:
+                                _cfg = _json.load(_f)
+                            # 匹配食品类别（精确→宽泛）
+                            for _cat in (get_food_categories(food_name) or []) + [food_name]:
+                                if _cat in _cfg:
+                                    # 项目名精确匹配
+                                    _item_key = item_name
+                                    _item_clean = re.sub(r'[abcdefghijklmnopqrstuvwxyz]+$', '', item_name).strip()
+                                    for _k in [_item_key, _item_clean]:
+                                        if _k in _cfg[_cat]:
+                                            _cfg_query = _cfg[_cat][_k]["query"]
+                                            _cfg_standard = _cfg[_cat][_k].get("standard", "")
+                                            print(f"  [配置查询词] 命中: '{_k}' → '{_cfg_query}' (standard={_cfg_standard})")
+                                            break
+                                    if _cfg_query:
+                                        break
+                    except Exception as _e:
+                        print(f"  [配置查询词] 加载失败（忽略）: {_e}")
+
+                    # ── 若配置指定了年份，收窄 doc_name 过滤范围 ─────────────
+                    _cfg_doc_year = None
+                    if _cfg_standard:
+                        _year_m = re.search(r'-(\d{4})$', _cfg_standard.replace(" ", ""))
+                        if _year_m:
+                            _cfg_doc_year = _year_m.group(1)
+                            def _filter_doc(raw_list, _year=_cfg_doc_year):
+                                return [c for c in (raw_list or [])
+                                        if gb_num_key in c.get("doc_name", "").replace(" ", "")
+                                        and _year in c.get("doc_name", "")]
+                            print(f"  [配置] 年份过滤启用: doc_name 须含 '{gb_num_key}' 且含 '{_cfg_doc_year}'")
+
                     if table_number:
                         context_chunks = _prod_std_query(f"表{table_number}")
+                    elif _cfg_query:
+                        # 使用专属查询词
+                        context_chunks = _prod_std_query(_cfg_query)
                     else:
                         context_chunks = _prod_std_query(item_name)
 

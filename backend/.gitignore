@@ -21,6 +21,10 @@ env/
 *.zip
 static/uploads/*.pdf
 static/cache/*.json
+static/screenshots/*.png
+static/downloads/
+config.local.json
+gb_verify.log
 
 # 系统文件
 .DS_Store

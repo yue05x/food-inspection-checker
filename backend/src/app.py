@@ -4,7 +4,11 @@ import json
 import os
 import re
 import sys
+import mimetypes
 from pathlib import Path
+
+# 修复 Windows 下 Python mimetypes 可能把 PDF 识别为下载流，导致 iframe 无法内嵌直接变下载的问题
+mimetypes.add_type('application/pdf', '.pdf')
 
 # 确保当前目录在 Python 路径中，以便导入 verifier2
 sys.path.insert(0, str(Path(__file__).parent))

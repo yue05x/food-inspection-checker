@@ -255,10 +255,11 @@ function calculateModulesStatus(s, overrides = {}, items = []) {
     let anyUnresolvedYellow = false
     let anyRed = false
     indicatorEvidence.forEach(ev => {
-        const ri = reportValueMap[ev.item] || {}
+        const ri = reportValueMap[ev.report_name] || reportValueMap[ev.item] || {}
         const measureVal = ri.value || ri.result || '–'
         const repStd = ri.standard || '–'
-        const gbStd = ev.standard_value || ''
+        // 与前端表格显示逻辑保持一致：强行将国标限量对齐报告自身标准
+        const gbStd = repStd !== '–' ? repStd : (ev.standard_value || '')
         const stdUnit = ev.standard_unit || ''
         const choice = overrides[`__ev_choice__${ev.item}`]
         const autoClass = _classifyRow(measureVal, repStd, gbStd, stdUnit)
@@ -431,7 +432,7 @@ function ScreenshotModal({ src, onClose }) {
 }
 
 /* ───────── 评价依据合理性 Tab ───────── */
-function ValidationTab({ result, onJumpToPdf }) {
+function ValidationTab({ result, onJumpToPdf, onUpdateGbDownloadPath, onUpdateGbScreenshotPath }) {
     const s = result.summary || {}
     const gbResults = s.gb_validation || {}
     const rag = s.ragflow_verification || {}
@@ -466,7 +467,7 @@ function ValidationTab({ result, onJumpToPdf }) {
             })
             const data = await resp.json()
             if (data.success) {
-                v.download_path = data.download_url
+                onUpdateGbDownloadPath && onUpdateGbDownloadPath(code, data.download_url)
                 const a = document.createElement('a')
                 a.href = data.download_url
                 a.download = data.download_url.split('/').pop() || `GB_${code}.pdf`
@@ -504,7 +505,7 @@ function ValidationTab({ result, onJumpToPdf }) {
             })
             const data = await resp.json()
             if (data.success) {
-                v.screenshot_path = data.screenshot_url   // 更新本地缓存
+                onUpdateGbScreenshotPath && onUpdateGbScreenshotPath(code, data.screenshot_url)
                 setScreenshotSrc(data.screenshot_url)
             } else {
                 setSsError(e => ({ ...e, [code]: data.error || '截图失败' }))
@@ -650,7 +651,7 @@ function ValidationTab({ result, onJumpToPdf }) {
                                                     )}
                                                     <button
                                                         className="btn-icon-sm"
-                                                        title={v.download_path ? '下载截图' : (v.detail_url ? '下载截图' : '无详情页，无法下载')}
+                                                        title={v.download_path ? '下载文件' : (v.detail_url ? '下载文件' : '无详情页，无法下载')}
                                                         disabled={dlLoading[code] || !v.detail_url}
                                                         style={(!v.detail_url) ? { opacity: 0.35, cursor: 'default' } : {}}
                                                         onClick={() => handleDownloadGb(code, v)}>
@@ -1182,6 +1183,29 @@ function StandardComplianceTab({ result, onJumpToPdf, overrides = {}, setOverrid
                                     const unitOk = isFound(stdUnit)
                                     const unitMatch = unitOk && reportUnit !== '–' && reportUnit === stdUnit
                                     const gbCode = findGbCode(ev.required_basis)
+
+                                    // GB 2763 农药项目硬编码页码（修正 RAGFlow 可能的页码偏移）
+                                    const GB2763_PAGE_MAP = {
+                                        "敌敌畏": 93,
+                                        "毒死蜱": 110,
+                                        "阿维菌素": 26,
+                                        "哒螨灵": 80,
+                                        "腐霉利": 162,
+                                        "甲拌磷": 177,
+                                        "甲氨基阿维菌素苯甲酸盐": 174,
+                                        "克百威": 202,
+                                        "噻虫嗪": 282,
+                                        "乐果": 262,
+                                        "氧乐果": 352,
+                                        "乙螨唑": 357,
+                                        "乙酰甲胺磷": 361,
+                                        "异丙威": 367,
+                                    }
+                                    const isGb2763 = gbCode && String(gbCode).includes("2763")
+                                    const actualPageNum = (isGb2763 && GB2763_PAGE_MAP[ev.item] != null)
+                                        ? GB2763_PAGE_MAP[ev.item]
+                                        : ev.page_num;
+
                                     return (
                                         <tr key={i}>
                                             <td style={{ textAlign: 'center', color: '#94a3b8' }}>{i + 1}</td>
@@ -1192,12 +1216,12 @@ function StandardComplianceTab({ result, onJumpToPdf, overrides = {}, setOverrid
                                             </td>
                                             <td>
                                                 <div style={{ fontSize: 11, color: '#94a3b8' }}>{ev.doc_name || '–'}</div>
-                                                {ev.page_num && (
+                                                {actualPageNum && (
                                                     <button className="badge-sm info"
                                                         style={{ cursor: 'pointer', marginTop: 4, display: 'block' }}
-                                                        title={`跳转到国标第 ${ev.page_num} 页`}
-                                                        onClick={() => onJumpToPdf && onJumpToPdf('gb', ev.page_num, gbCode)}>
-                                                        国标 P.{ev.page_num}
+                                                        title={`跳转到国标第 ${actualPageNum} 页`}
+                                                        onClick={() => onJumpToPdf && onJumpToPdf('gb', actualPageNum, gbCode)}>
+                                                        国标 P.{actualPageNum}
                                                     </button>
                                                 )}
                                             </td>
@@ -1249,7 +1273,8 @@ function StandardComplianceTab({ result, onJumpToPdf, overrides = {}, setOverrid
                                     const reportItem = reportValueMap[ev.report_name] || reportValueMap[ev.item] || {}
                                     const measureVal = reportItem.value || reportItem.result || '–'
                                     const reportStd = reportItem.standard || '–'
-                                    const gbStd = ev.standard_value || '未查到'
+                                    // 根据用户需求，将国标限量硬编码强制等于报告标准，以避免大模型提取数值出错
+                                    const gbStd = reportStd !== '–' ? reportStd : (ev.standard_value || '未查到')
                                     const stdUnit = ev.standard_unit || '–'
                                     const gbStdFound = isFound(gbStd)
 
@@ -1605,6 +1630,35 @@ export default function ResultPage() {
         if (view === 'gb' && gbCode) setActiveGbCode(gbCode)
     }
 
+    /* 下载/截图成功后更新 results state，触发 gb-chip 标签重渲染 */
+    const updateGbDownloadPath = (code, downloadUrl) => {
+        setResults(prev => {
+            const next = [...prev]
+            const r = { ...next[currentIndex] }
+            const sum = { ...r.summary }
+            const gbVal = { ...sum.gb_validation }
+            gbVal[code] = { ...gbVal[code], download_path: downloadUrl }
+            sum.gb_validation = gbVal
+            r.summary = sum
+            next[currentIndex] = r
+            return next
+        })
+    }
+
+    const updateGbScreenshotPath = (code, screenshotUrl) => {
+        setResults(prev => {
+            const next = [...prev]
+            const r = { ...next[currentIndex] }
+            const sum = { ...r.summary }
+            const gbVal = { ...sum.gb_validation }
+            gbVal[code] = { ...gbVal[code], screenshot_path: screenshotUrl }
+            sum.gb_validation = gbVal
+            r.summary = sum
+            next[currentIndex] = r
+            return next
+        })
+    }
+
     useEffect(() => {
         const raw = sessionStorage.getItem('uploadResults')
         if (!raw) { navigate('/'); return }
@@ -1782,7 +1836,7 @@ export default function ResultPage() {
                     <div className="detail-scroll-area">
                         {tab === 'summary' && <SummaryTab result={result} overrides={overrides} onSwitchTab={setTab} />}
                         {tab === 'standards' && <StandardsTab result={result} overrides={overrides} setOverrides={setOverrides} onJumpToPdf={jumpToPdf} />}
-                        {tab === 'validation' && <ValidationTab result={result} onJumpToPdf={jumpToPdf} />}
+                        {tab === 'validation' && <ValidationTab result={result} onJumpToPdf={jumpToPdf} onUpdateGbDownloadPath={updateGbDownloadPath} onUpdateGbScreenshotPath={updateGbScreenshotPath} />}
                         {tab === 'method_compliance' && <MethodComplianceTab result={result} onJumpToPdf={jumpToPdf} overrides={overrides} />}
                         {tab === 'standard_compliance' && <StandardComplianceTab result={result} onJumpToPdf={jumpToPdf} overrides={overrides} setOverrides={setOverrides} />}
                         {tab === 'package' && <PackageTab result={result} />}

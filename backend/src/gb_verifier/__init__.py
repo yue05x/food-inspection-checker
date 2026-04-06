@@ -132,6 +132,32 @@ def _verify_single_code_logic(
         except Exception as e:
             logger.warning("详情页处理异常 %s: %s", gb_code, e)
         
+        # ── 空结果检测：若关键字段全为空，说明提取失败而非标准无效 ──────────
+        _extraction_empty = (
+            not parsed.get("status")
+            and not parsed.get("implement_date")
+            and not parsed.get("abolish_date")
+            and not parsed.get("publish_date")
+            and not parsed.get("foodmate_detail_page_url")
+        )
+        if _extraction_empty:
+            logger.warning("提取结果为空 %s：Tavily 未能获取任何标准信息，标记为 error 以触发短期重试", gb_code)
+            return {
+                "passed": False,
+                "status": "error",
+                "status_text": "无法获取标准信息",
+                "publish_date": None,
+                "implement_date": None,
+                "abolish_date": None,
+                "detail_url": None,
+                "screenshot_path": None,
+                "download_path": None,
+                "reasons": ["Tavily 未能提取到任何标准信息（日期、状态、详情页 URL 均为空），请稍后重试"],
+                "error": "extraction_empty",
+                "timestamp": time.time()
+            }
+        # ─────────────────────────────────────────────────────────────────────
+
         # ── 状态推断兜底：若 status 字段为空，尝试从日期字段推断 ──────────────
         if not parsed.get("status"):
             abolish = parsed.get("abolish_date", "")

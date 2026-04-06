@@ -369,7 +369,25 @@ def extract_inspection_items(report: Dict[str, Any]) -> List[Dict[str, Any]]:
             value = row[col_idx]
             if value is None:
                 return ""
-            return str(value).strip()
+            text = str(value)
+            # pdfplumber 对跨行单元格保留 \n，需要合并处理
+            # 1. 化学式角标分行：如"硝酸盐(以NaNO 计)\n3" → 数字角标被移到括号后
+            #    正确结果应是"硝酸盐(以NaNO3计)"，需把行末数字移到字母后、括号前
+            #    格式特征：行末以"[字母] [中文])"结尾 + 下一行是纯数字
+            text = re.sub(
+                r'([A-Za-z])\s+([^\n]*?\))\s*\n\s*(\d+)\b',
+                lambda m: m.group(1) + m.group(3) + m.group(2),
+                text
+            )
+            # 2. 其他分行角标：行末以字母/汉字/右括号结尾，下一行是纯数字（如"素M\n1"→"素M1"）
+            text = re.sub(r'(?<=[A-Za-z\u4e00-\u9fa5\)）])\s*\n\s*(\d+)(?=\s|\n|$)', r'\1', text)
+            # 3. 一般换行合并：换行前后均为非空字符，直接拼接（如"维生素K\n1"→"维生素K1"）
+            text = re.sub(r'([^\s])\n([^\s])', r'\1\2', text)
+            # 4. 剩余换行（方法名中的合理换行）→ 空格
+            text = text.replace('\n', ' ')
+            # 5. 合并多余空白
+            text = re.sub(r'  +', ' ', text)
+            return text.strip()
 
         for row in table[1:]:
             record: Dict[str, Any] = {
